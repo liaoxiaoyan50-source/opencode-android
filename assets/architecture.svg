@@ -1,0 +1,106 @@
+<svg viewBox="0 0 1280 860" xmlns="http://www.w3.org/2000/svg" font-family="'PingFang SC','Microsoft YaHei',sans-serif">
+  <style>
+    :root {
+      --bg: #0d1117; --panel: #161b22; --panel2: #1c2333; --line: #30363d;
+      --txt: #e6edf3; --sub: #8b949e; --accent: #58a6ff; --green: #3fb950;
+      --orange: #d29922; --red: #f85149; --purple: #bc8cff;
+    }
+    .panel { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; rx: 12; }
+    .panel2 { fill: var(--panel2); stroke: var(--line); stroke-width: 1; }
+    .h1 { fill: var(--txt); font-size: 22px; font-weight: 700; }
+    .h2 { fill: var(--txt); font-size: 15px; font-weight: 600; }
+    .sub { fill: var(--sub); font-size: 12px; }
+    .tag { fill: var(--accent); font-size: 12px; }
+    .ok { fill: var(--green); }
+    .warn { fill: var(--orange); }
+  </style>
+
+  <rect width="1280" height="860" fill="var(--bg)"/>
+  <text x="40" y="46" class="h1">OpenCode Mobile · 总体架构</text>
+  <text x="40" y="70" class="sub">本地引擎 = None(远程客户端) / Ubuntu(proot 快照引擎) · 快照预打包 · 免 root</text>
+
+  <!-- UI 层 -->
+  <rect x="40" y="92" width="1200" height="120" class="panel"/>
+  <text x="60" y="122" class="h2">UI 层 <tspan class="sub">Kotlin + Compose · 三阶段: M1 终端形态 → M2 原生会话 → M3 工作区</tspan></text>
+  <g>
+    <rect x="60" y="140" width="180" height="54" class="panel2"/><text x="150" y="162" text-anchor="middle" class="h2">会话聊天流</text><text x="150" y="182" text-anchor="middle" class="sub">SSE 渲染 · Markdown</text>
+    <rect x="256" y="140" width="180" height="54" class="panel2"/><text x="346" y="162" text-anchor="middle" class="h2">权限审批弹窗</text><text x="346" y="182" text-anchor="middle" class="sub">permission.asked</text>
+    <rect x="452" y="140" width="180" height="54" class="panel2"/><text x="542" y="162" text-anchor="middle" class="h2">Key / 代理设置</text><text x="542" y="182" text-anchor="middle" class="sub">Keystore 加密存储</text>
+    <rect x="648" y="140" width="180" height="54" class="panel2"/><text x="738" y="162" text-anchor="middle" class="h2">终端形态(M1)</text><text x="738" y="182" text-anchor="middle" class="sub">fork bash 跑 TUI</text>
+    <rect x="844" y="140" width="180" height="54" class="panel2"/><text x="934" y="162" text-anchor="middle" class="h2">引擎状态卡</text><text x="934" y="182" text-anchor="middle" class="sub">端口 / 内存 / 版本</text>
+    <rect x="1040" y="140" width="180" height="54" class="panel2"/><text x="1130" y="162" text-anchor="middle" class="h2">工作区(M3)</text><text x="1130" y="182" text-anchor="middle" class="sub">文件 / diff / git</text>
+  </g>
+
+  <!-- EngineClient -->
+  <rect x="40" y="232" width="1200" height="64" class="panel"/>
+  <text x="60" y="258" class="h2">EngineClient <tspan class="sub">REST + SSE · 同一套客户端, 仅 baseUrl 不同</tspan></text>
+  <text x="640" y="284" text-anchor="middle" class="tag">None 模式: https://your-server:4096 (Tailscale/SSH 隧道)　│　Ubuntu 模式: http://127.0.0.1:{port}</text>
+
+  <!-- EngineService -->
+  <rect x="40" y="316" width="1200" height="150" class="panel"/>
+  <text x="60" y="346" class="h2">EngineService <tspan class="sub">Foreground Service (dataSync) · 状态机 STOPPED→INSTALLING→STARTING→READY</tspan></text>
+  <g>
+    <rect x="60" y="364" width="270" height="80" class="panel2"/><text x="195" y="390" text-anchor="middle" class="h2">快照安装器</text>
+    <text x="195" y="410" text-anchor="middle" class="sub">SHA-256 校验 · .tmp 解压</text><text x="195" y="428" text-anchor="middle" class="sub">原子 rename · 幂等 meta</text>
+    <rect x="346" y="364" width="270" height="80" class="panel2"/><text x="481" y="390" text-anchor="middle" class="h2">ExecCompat</text>
+    <text x="481" y="410" text-anchor="middle" class="sub">noexec 探测 → DIRECT / QEMU</text><text x="481" y="428" text-anchor="middle" class="sub">qemu-user 数据加载兜底</text>
+    <rect x="632" y="364" width="270" height="80" class="panel2"/><text x="767" y="390" text-anchor="middle" class="h2">健康检查 + 守护</text>
+    <text x="767" y="410" text-anchor="middle" class="sub">GET /global/health 轮询</text><text x="767" y="428" text-anchor="middle" class="sub">崩溃退避重启 ×3 终态</text>
+    <rect x="918" y="364" width="302" height="80" class="panel2"/><text x="1069" y="390" text-anchor="middle" class="h2">保活与引导</text>
+    <text x="1069" y="410" text-anchor="middle" class="sub">WakeLock · 幻影进程 adb 引导</text><text x="1069" y="428" text-anchor="middle" class="sub">电池优化豁免 · 内存水位</text>
+  </g>
+
+  <!-- proot 引擎层 -->
+  <rect x="40" y="486" width="1200" height="180" class="panel" style="stroke:var(--accent);stroke-width:2"/>
+  <text x="60" y="516" class="h2">引擎进程树 <tspan class="sub">nativeLibraryDir 唯一可执行区(targetSdk≥29 noexec)</tspan></text>
+  <g>
+    <rect x="60" y="534" width="250" height="112" class="panel2" style="stroke:var(--purple)"/>
+    <text x="185" y="562" text-anchor="middle" class="h2" fill="var(--purple)">libproot.so</text>
+    <text x="185" y="584" text-anchor="middle" class="sub">NDK 编译 · 16KB 对齐</text>
+    <text x="185" y="602" text-anchor="middle" class="sub">-0 伪装root · bind 挂载</text>
+    <text x="185" y="620" text-anchor="middle" class="sub">-q qemu(降级模式)</text>
+    <text x="185" y="638" text-anchor="middle" class="sub">ptrace 模拟 execve</text>
+
+    <rect x="330" y="534" width="400" height="112" class="panel2" style="stroke:var(--green)"/>
+    <text x="530" y="562" text-anchor="middle" class="h2" fill="var(--green)">Ubuntu 24.04 arm64 rootfs 快照</text>
+    <text x="530" y="584" text-anchor="middle" class="sub">/usr/local/bin/opencode (官方单文件 ~110MB)</text>
+    <text x="530" y="602" text-anchor="middle" class="sub">git · curl · ripgrep · fd · gh · tmux · openssh</text>
+    <text x="530" y="620" text-anchor="middle" class="sub">预配置 LANG=C.UTF-8 · opencode.json 模板</text>
+    <text x="530" y="638" text-anchor="middle" class="sub">解压自 assets(full) / GitHub Release(lite) · ~120-160MB</text>
+
+    <rect x="750" y="534" width="230" height="112" class="panel2"/>
+    <text x="865" y="562" text-anchor="middle" class="h2">opencode serve</text>
+    <text x="865" y="584" text-anchor="middle" class="sub">--hostname 127.0.0.1</text>
+    <text x="865" y="602" text-anchor="middle" class="sub">--port {4096..} + Basic Auth</text>
+    <text x="865" y="620" text-anchor="middle" class="sub">SQLite 会话库(升级保留)</text>
+    <text x="865" y="638" text-anchor="middle" class="sub">HTTP_PROXY 透传出网</text>
+
+    <rect x="1000" y="534" width="220" height="112" class="panel2"/>
+    <text x="1110" y="562" text-anchor="middle" class="h2">/workspace bind</text>
+    <text x="1110" y="584" text-anchor="middle" class="sub">外部私有目录</text>
+    <text x="1110" y="602" text-anchor="middle" class="sub">系统文件管理器可达</text>
+    <text x="1110" y="620" text-anchor="middle" class="sub">网盘同步 · 代码落盘</text>
+    <text x="1110" y="638" text-anchor="middle" class="sub">快照升级不覆盖</text>
+  </g>
+
+  <!-- 外部 -->
+  <rect x="40" y="686" width="590" height="80" class="panel"/>
+  <text x="60" y="714" class="h2">LLM Provider API <tspan fill="var(--orange)">(Anthropic / OpenAI / …)</tspan></text>
+  <text x="60" y="740" class="sub">经用户配置代理出网(国内必需) · Key 注入 guest auth.json 权限600</text>
+  <path d="M 630 590 L 630 726 L 700 726" stroke="var(--orange)" stroke-width="2" fill="none" stroke-dasharray="6 4"/>
+  <polygon points="700,726 690,721 690,731" fill="var(--orange)"/>
+
+  <rect x="650" y="686" width="590" height="80" class="panel"/>
+  <text x="670" y="714" class="h2">远程 opencode serve <tspan class="tag">None 模式</tspan></text>
+  <text x="670" y="740" class="sub">用户自有 Ubuntu 服务器 · /global/health 探活 · 同一套 UI 驱动</text>
+
+  <!-- 连接线 -->
+  <path d="M 640 212 L 640 232" stroke="var(--line)" stroke-width="2"/>
+  <path d="M 640 296 L 640 316" stroke="var(--line)" stroke-width="2"/>
+  <path d="M 640 466 L 640 486" stroke="var(--accent)" stroke-width="2"/>
+  <path d="M 310 590 L 330 590" stroke="var(--purple)" stroke-width="2"/>
+  <path d="M 730 590 L 750 590" stroke="var(--green)" stroke-width="2"/>
+
+  <text x="40" y="812" class="sub">端口/权限双保险: 127.0.0.1 + 随机端口 + OPENCODE_SERVER_PASSWORD　·　快照锁版本(manifest.json)　·　会话库与 /workspace 跨快照升级保留</text>
+  <text x="40" y="834" class="sub">M0 先行实验: noexec 行为真机定案(DIRECT or QEMU) → 16KB page 模拟器冒烟 → 幻影进程引导页验收</text>
+</svg>
