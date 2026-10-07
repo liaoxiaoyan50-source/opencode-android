@@ -203,14 +203,14 @@ opencode serve --hostname 127.0.0.1 --port {port}
 
 ## 7. 代码骨架
 
-> 4 个完整文件在 `code/` 目录，可直接入仓。此处说明设计要点。
+> 全部代码与脚本已按 §8 标准工程布局入仓（`team-output/` 收录 P1–P6 分层设计文档）。本节说明设计要点。
 
 | 文件 | 职责 | 关键变量/设计 |
 |------|------|---------------|
-| `code/build-snapshot.sh` | CI 内构建快照（在 **arm64 runner** 上原生 chroot，无需 qemu） | `OC_VERSION` 锁版本；`ROOTFS` 解包目录；预装工具链清单；`EXCLUDE` 打包时剔除 `/workspace`、会话库；产出 `manifest.json`（version/sha256/ocVersion） |
-| `code/SnapshotInstaller.kt` | 校验→解压→幂等落盘 | `TarArchiveInputStream(GZIPInputStream)` 流式（零额外原生依赖）；`.tmp` 解压 + 原子 rename；`meta.json` 幂等标记；SHA-256 边下边算；`onProgress` 回调供 UI |
-| `code/EngineService.kt` | 前台服务 + proot 编排 + 健康检查 | `ExecCompat.detect()` 选 proot/`-q` 模式；`buildProotCommand()` 构造 bind 挂载；`awaitHealthy()` 轮询 `/global/health`；`restartGuard` 崩溃重启退避 |
-| `code/release.yml` | GitHub Actions 双 job | `snapshot`(arm64 runner) 产快照+manifest；`android`(x86 runner) 编 proot/qemu(jniLibs) + gradle 出 full/lite 双 APK，产物传 Release |
+| `snapshot/build-snapshot.sh` | CI 内构建快照（在 **arm64 runner** 上原生 chroot，无需 qemu） | `OC_VERSION` 锁版本；`ROOTFS` 解包目录；预装工具链清单；`EXCLUDE` 打包时剔除 `/workspace`、会话库；产出 `manifest.json`（version/sha256/ocVersion） |
+| `app/src/main/java/dev/opencode/mobile/engine/SnapshotInstaller.kt` | 校验→解压→幂等落盘 | `TarArchiveInputStream(GZIPInputStream)` 流式（零额外原生依赖）；`.tmp` 解压 + 原子 rename；`meta.json` 幂等标记；SHA-256 边下边算；`onProgress` 回调供 UI |
+| `app/src/main/java/dev/opencode/mobile/engine/EngineService.kt` | 前台服务 + proot 编排 + 健康检查 | `ExecCompat.detect()` 选 proot/`-q` 模式；`buildProotCommand()` 构造 bind 挂载；`awaitHealthy()` 轮询 `/global/health`；`restartGuard` 崩溃重启退避 |
+| `.github/workflows/release.yml` | GitHub Actions 双 job | `snapshot`(arm64 runner) 产快照+manifest；`android`(x86 runner) 编 proot/qemu(jniLibs) + gradle 出 full/lite 双 APK，产物传 Release |
 
 ### 7.1 proot 命令构造（EngineService 核心逻辑预览）
 
@@ -340,4 +340,4 @@ adb shell "device_config get activity_manager max_phantom_processes"   # 期望 
 
 ---
 
-*配套文件：`code/build-snapshot.sh` · `code/SnapshotInstaller.kt` · `code/EngineService.kt` · `code/release.yml` · `assets/architecture.svg`*
+*配套文件：`snapshot/build-snapshot.sh` · `native/`（proot/qemu 构建脚本）· `app/src/main/java/dev/opencode/mobile/engine/`（SnapshotInstaller/EngineService）· `.github/workflows/release.yml` · `team-output/`（P1–P6 设计文档）· `assets/architecture.svg`*
