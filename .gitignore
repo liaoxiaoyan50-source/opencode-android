@@ -1,0 +1,14 @@
+# 构建中间产物
+.build-*/
+.build-qemu/
+.build-proot/
+dist/
+app/build/
+.gradle/
+local.properties
+.DS_Store
+*.iml
+
+# 快照构建输出
+oc-ubuntu-arm64.tar.gz
+manifest.json
