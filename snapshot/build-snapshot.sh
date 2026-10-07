@@ -41,6 +41,11 @@ OPENCODE_RELEASES_PAGE="https://github.com/anomalyco/opencode/releases"
 
 # ───────────────────────── [B] 产物 / schema 常量 / 清单 ─────────────────────────
 OUT_DIR="${OUT_DIR:-dist}"
+# 构建工作目录：rootfs 解包 / chroot 现场（[1/6]–[5/6] 与 cleanup 共用，仅本处定义）。
+# cleanup（[C] 节 EXIT trap）触发时才展开本变量，故定义必须早于 trap 注册——
+# 放 [B] 节路径常量区与 OUT_DIR 相邻，正确性与可读性同时满足。支持环境覆盖
+# （sudo -E 自提升透传；两次执行 cwd 不变，$(pwd) 派生值稳定一致）。
+ROOTFS="${ROOTFS:-$(pwd)/.rootfs-build}"
 SNAP_NAME="oc-ubuntu-arm64.tar.gz"
 # P1 §3.1: snapshotVersion 格式 YYYYMMDD-oc<ocVersion>，比较为纯字典序；
 # date -u 固定 UTC，消除 runner 时区漂移对字典序单调性的影响。
@@ -102,6 +107,14 @@ echo "==> 快照版本 ${SNAPSHOT_VERSION} | opencode ${OC_VERSION} | ubuntu-bas
 
 # ───────────────────────── [1/6] 解包 ubuntu-base ─────────────────────────
 echo "==> [1/6] 解包 ubuntu-base ${UBUNTU_BASE_VER} arm64"
+# 干净起点（幂等重跑）：CI runner 每次全新，但本地复跑同目录时，上次失败被
+# cleanup 刻意保留的现场会以「覆盖合并」语义混入本次快照（旧二进制 / 旧 apt
+# 状态不被清走）；且残留 bind 挂载若未 detach，rm -rf 遇挂载点报
+# "Device or resource busy" 非 0 退出。先防御性 lazy umount（与 cleanup 同构），
+# 再清空重建；tar -C 要求目录存在，mkdir -p 必须先于解包。
+umount -l "${ROOTFS}/proc" "${ROOTFS}/sys" "${ROOTFS}/dev" 2>/dev/null || true
+rm -rf "${ROOTFS}"
+mkdir -p "${ROOTFS}"
 # pipefail 下 curl 失败（含 404/断流）即整体失败；--retry 抗 cdimage 偶发抖动
 curl -fsSL --retry 5 --retry-delay 3 "${UBUNTU_BASE_URL}" | tar xz -C "${ROOTFS}"
 
