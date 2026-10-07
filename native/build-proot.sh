@@ -206,18 +206,45 @@ fi
 (
   cd "$PROOT_DIR"
   # 参数与 termux-packages packages/proot/build.sh 对齐：
-  #   -C src ............................ termux/proot 构建入口为 src/Makefile
+  #   -C src ............................ termux/proot 构建入口为 src/GNUmakefile
   #   PROOT_WITH_LIBANDROID_SHMEM=true .. 启用 ashmem shm 分支（引用 step1 产物）
   #   -DARG_MAX / -DVERSION ............. termux 配方原样 CPPFLAGS
   #   -static ........................... C3 静态优先（bionic libc 静态入包）
   #   ALIGN_LDFLAG ...................... D7：16KB host page LOAD 段对齐
-  make -C src -j"$JOBS" \
-    PROOT_WITH_LIBANDROID_SHMEM=true \
-    CC="$CC" \
-    CPPFLAGS="-DARG_MAX=131072 -DVERSION=\"${PROOT_REF#v}\" -I$STAGING/include" \
-    CFLAGS="-O2 $ALIGN_LDFLAG" \
-    LDFLAGS="-static $ALIGN_LDFLAG -L$STAGING/lib" \
-    LDLIBS="-ltalloc -landroid-shmem"
+  #
+  # ── CI run#5 根因修复（step#11 链接期 undefined reference）──────────────────
+  # CC/CPPFLAGS/CFLAGS/LDFLAGS 必须以【环境变量】前缀传给 make，不得写成 make
+  # 命令行参数：GNU make 优先级 = 命令行变量 > makefile 内赋值（含 +=），
+  # 命令行传 flags 会把 GNUmakefile 的这些追加全部压掉——
+  #     CPPFLAGS += -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$(VPATH)
+  #     CFLAGS   += -Wall -Wextra -O2 -DWITH_LIBANDROID_SHMEM
+  #     LDFLAGS  += -ltalloc -Wl,-z,noexecstack（ifdef 分支另 += -landroid-shmem）
+  # → -ltalloc / -landroid-shmem 根本进不了链接行 → undefined reference。
+  # 改为环境变量后（优先级低于 makefile 赋值），+= 正常追加，与 termux 官方
+  # 构建一致。已用 pinned GNUmakefile + make -n 干跑验证最终装配：
+  #   proot 链接 = <objs> -static -Wl,-z,max-page-size=16384 -L<staging>/lib
+  #                -llog -landroid -ltalloc -Wl,-z,noexecstack -landroid-shmem
+  #
+  # -llog / -landroid = 静态链 libandroid-shmem v0.7 的硬依赖（源码实测）：
+  #   shmem.c 无条件 #include <android/log.h>，DBG(...)=__android_log_print；
+  #   android26（API>=26）分支改走 ASharedMemory_create/getSize（属 libandroid）。
+  #   NDK sysroot 自带 liblog.a / libandroid.a，按需抽成员、不产生 NEEDED，
+  #   step4 的零依赖断言仍成立。二者置于 GNUmakefile 追加的 -landroid-shmem
+  #   之前即可：NDK r19+ 固定用 lld，lld 对静态库惰性解析、与顺序无关
+  #   （本机实测：GNU ld 同序报 undefined reference，lld 同序链接通过）。
+  #
+  # 其他兼容点（均已核验，无需改动）：
+  #   * loader 用独立 LOADER_LDFLAGS（-static -nostdlib -Wl,-Ttext=...）链接，
+  #     不消费 $(LDFLAGS) → env 传法不污染 freestanding loader（干跑已验证）；
+  #   * OBJIFY 走 host objcopy/objdump（GNUmakefile ?= 默认），run#5 能到主
+  #     链接说明二者已成功产出 loader-wrapped.o，无需干预；
+  #   * build.h 的 git describe --tags --dirty --abbrev=8 --always 在 --depth 1
+  #     下由 --always 兜底（tag 在手则描述为 v5.1.107.96），无需干预。
+  CC="$CC" \
+  CPPFLAGS="-DARG_MAX=131072 -DVERSION=\"${PROOT_REF#v}\" -I$STAGING/include" \
+  CFLAGS="-O2" \
+  LDFLAGS="-static $ALIGN_LDFLAG -L$STAGING/lib -llog -landroid" \
+  make -C src -j"$JOBS" PROOT_WITH_LIBANDROID_SHMEM=true
   "$STRIP" src/proot
 )
 
@@ -231,8 +258,7 @@ PROOT_BIN="$PROOT_DIR/src/proot"
   || die "架构断言失败：产物不是 AArch64"
 
 # (b) C3 静态断言：NEEDED 必须为 0（零额外 .so 依赖）
-readelf_dyn() { "$READELF" -d "$1" 2>/dev/null || true; }
-NEEDED="$(readelf_dyn "$PROOT_BIN" | awk '/NEEDED/{print}')"
+NEEDED="$("$READELF" -d "$PROOT_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3）：
 $NEEDED"
