@@ -120,8 +120,20 @@ fi
   cd "$SHMEM_DIR"
   # 上游为单文件 C 库（ashmem 模拟），无构建系统耦合：直接逐文件编译打包。
   # 注意 CC 为 NDK clang，静态产物不含任何动态依赖。
+  #
+  # -D_PATH_TMP='"/tmp/"'（CI 实测 NDK 30 / bionic 必需）：shmem.c:352 经
+  #   ASHV_KEY_SYMLINK_PATH 引用 _PATH_TMP 拼接 key 符号链接路径，而 AOSP
+  #   bionic 的 paths.h 无此宏（glibc 独有）→ 编译期 undeclared identifier。
+  #   termux 靠 ndk-patches/<n>/paths.h.patch 构建期给 NDK sysroot 追加
+  #   _PATH_TMP（值 = $PREFIX/tmp/）；我们运行环境非 termux、无 $PREFIX，
+  #   按 glibc 语义注入等价值：bash 单引号包双引号字面量，clang 实际收到
+  #   -D_PATH_TMP="/tmp/"，宏值为字符串字面量，拼接后 = "/tmp/ashv_key_%d"。
+  #   冲突自查：shmem.c 及其包含头均无 _PATH_TMP 的 #define（仅此一处引用），
+  #   命令行 define 无重定义冲突。运行时影响面：仅 proot 的 sysvipc 可选
+  #   扩展在 chroot 内客户程序使用 SysV IPC 时激活；opencode（Node.js）不用
+  #   SysV shm，proot 核心 chroot/bind/exec 路径零依赖。
   for f in *.c; do
-    "$CC" -O2 -D_GNU_SOURCE -I. -c "$f" -o "${f%.c}.o"
+    "$CC" -O2 -D_GNU_SOURCE -D_PATH_TMP='"/tmp/"' -I. -c "$f" -o "${f%.c}.o"
   done
   "$AR" rcs libandroid-shmem.a *.o
   "$RANLIB" libandroid-shmem.a
