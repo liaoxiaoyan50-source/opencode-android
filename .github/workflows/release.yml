@@ -140,7 +140,12 @@ jobs:
           gradle-version: "8.7"
           cache-disabled: true
 
-      - uses: android-actions/setup-android@v3
+      # [run#4 修复] v3 默认 packages="tools platform-tools", Google 已下架 legacy "tools" 包
+      # → sdkmanager "Failed to find package 'tools'" 退出码 1 → step 失败 (同源案例 OmniBot PR #535)。
+      # 升级官方修复版 v4: 默认 packages 仅 platform-tools / cmdline-tools 22.0 / 请求 tools 仅 warning;
+      # 且始终预接受 SDK license, 为 AGP 未来缺组件自动安装兜底 (当前构建链不触发 sdkmanager)。
+      # 本 step 未传任何 with: 输入, v3→v4 为零适配 drop-in; ANDROID_HOME 由 runner 镜像注入, 不依赖本 action。
+      - uses: android-actions/setup-android@v4
 
       - name: Locate NDK (供 native 两脚本与 gate ① 使用)
         run: |
