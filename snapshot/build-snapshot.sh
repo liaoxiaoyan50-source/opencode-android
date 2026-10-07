@@ -28,8 +28,15 @@ set -Eeuo pipefail
 OC_VERSION="${1:-${OC_VERSION:-1.18.34}}"
 
 # ubuntu-base 小版本：cdimage 直链防漂移（README 附录 B）。升级时同步更新 P2a 预算表。
-UBUNTU_BASE_VER="24.04.2"
-UBUNTU_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-${UBUNTU_BASE_VER}-base-arm64.tar.gz"
+# [2026-10-07 修复] 24.04.2 直链已被 cdimage 移除（404，CI run#3 即此因）：静态单点常量对「必然
+#   过期的点版本直链」无防漂移能力。改为「候选列表 + 回退探测」（[A2] resolve_ubuntu_base）：
+#   首项=当前锁定版本，正常路径命中即等价硬钉，P2a 可复现口径不变；首项被移除时依序回退并醒目
+#   告警，实际命中值由 manifest.ubuntuBase 派生记录（产物自描述）。
+#   升级锁版本：把新点版本插到候选首位，并同步更新 P2a 预算表；
+#   严格复现历史构建：UBUNTU_BASE_VER=24.04.5 ./build-snapshot.sh 环境变量硬钉（跳过探测，仅 HEAD 预检）。
+UBUNTU_BASE_CANDIDATES=( 24.04.5 24.04.4 24.04.3 )
+UBUNTU_BASE_VER="${UBUNTU_BASE_VER:-}"   # 空=走候选探测；非空=硬钉。经 [C] exec sudo -E 自提升重入时透传
+# [2026-10-07 修复] 原 UBUNTU_BASE_URL 静态常量行删除：直链改由 [A2] resolve_ubuntu_base() 在版本敲定后派生。
 
 # opencode 官方 linux-arm64 单文件二进制（glibc 版）。资产名已于 v1.18.34 实证：
 # release 附件含 opencode-linux-arm64.tar.gz 与 opencode-linux-arm64-musl.tar.gz，
@@ -38,6 +45,46 @@ UBUNTU_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/u
 OPENCODE_ASSET="opencode-linux-arm64.tar.gz"
 OPENCODE_RELEASE_URL="https://github.com/anomalyco/opencode/releases/download/v${OC_VERSION}/${OPENCODE_ASSET}"
 OPENCODE_RELEASES_PAGE="https://github.com/anomalyco/opencode/releases"
+
+# ───────────────────────── [A2] ubuntu-base 多候选回退探测 ─────────────────────────
+# [2026-10-07 修复] 本块为全新增。仅定义函数、零副作用；真正调用点在 [1/6] 节首行——位于
+# [C] 自提升之后，避免 exec sudo 重入时重复探测，且失败 die 时已挂上 [C] 的 trap。
+probe_ubuntu_base() {
+  # HEAD 探测直链：0=可用（HTTP 200），非 0=404/网络失败。curl 失败用 || rc=$? 兜住，
+  # 保证在 set -Eeuo pipefail 与 ERR trap 下任何调用方式（if 包裹）都不会被误杀退出。
+  local ver="$1" rc=0
+  curl -fsIL --connect-timeout 10 --max-time 20 --retry 2 --retry-delay 2 \
+    "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-${ver}-base-arm64.tar.gz" \
+    >/dev/null 2>&1 || rc=$?
+  return "${rc}"
+}
+
+resolve_ubuntu_base() {
+  local ver
+  if [[ -n "${UBUNTU_BASE_VER}" ]]; then
+    # 环境变量硬钉（严格复现历史构建用）：仍预检一次，失效时报可读错误，而不是等 tar 解包报歧义错误
+    if ! probe_ubuntu_base "${UBUNTU_BASE_VER}"; then
+      die "环境变量硬钉的 ubuntu-base ${UBUNTU_BASE_VER} 直链已失效（HTTP 非 200）；请改用候选列表中的可用版本"
+    fi
+    echo "==> ubuntu-base 硬钉 ${UBUNTU_BASE_VER}（跳过候选探测，HEAD 预检通过）"
+  else
+    echo "==> ubuntu-base 候选探测顺序：${UBUNTU_BASE_CANDIDATES[*]}"
+    for ver in "${UBUNTU_BASE_CANDIDATES[@]}"; do
+      if probe_ubuntu_base "${ver}"; then
+        UBUNTU_BASE_VER="${ver}"
+        echo "==> ubuntu-base 命中候选：${UBUNTU_BASE_VER}（HEAD 200）"
+        break
+      fi
+      echo "==> ubuntu-base 候选 ${ver} 直链不可用（404/网络失败），尝试下一候选" >&2
+    done
+    if [[ -z "${UBUNTU_BASE_VER}" ]]; then
+      die "ubuntu-base 全部候选均不可用（${UBUNTU_BASE_CANDIDATES[*]}）；请人工核查 cdimage 目录并更新 UBUNTU_BASE_CANDIDATES 首项"
+    fi
+  fi
+  # 版本敲定后派生直链：原 [A] 节静态 UBUNTU_BASE_URL 常量由本行接管（manifest.ubuntuBase
+  # 继续随 ${UBUNTU_BASE_VER} 派生，release.yml gate ③ 只断言非空，零联动改动）
+  UBUNTU_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-${UBUNTU_BASE_VER}-base-arm64.tar.gz"
+}
 
 # ───────────────────────── [B] 产物 / schema 常量 / 清单 ─────────────────────────
 OUT_DIR="${OUT_DIR:-dist}"
@@ -106,6 +153,9 @@ command -v curl >/dev/null 2>&1 || die "缺少 curl（ubuntu-24.04 runner 自带
 echo "==> 快照版本 ${SNAPSHOT_VERSION} | opencode ${OC_VERSION} | ubuntu-base ${UBUNTU_BASE_VER}"
 
 # ───────────────────────── [1/6] 解包 ubuntu-base ─────────────────────────
+# [2026-10-07 修复] 先探测锁定实际版本再解包：命中值回填 UBUNTU_BASE_VER / UBUNTU_BASE_URL，
+# 本节 echo 与后续 manifest.ubuntuBase / P2a 记录随之取到真实版本。
+resolve_ubuntu_base
 echo "==> [1/6] 解包 ubuntu-base ${UBUNTU_BASE_VER} arm64"
 # 干净起点（幂等重跑）：CI runner 每次全新，但本地复跑同目录时，上次失败被
 # cleanup 刻意保留的现场会以「覆盖合并」语义混入本次快照（旧二进制 / 旧 apt
