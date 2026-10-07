@@ -1,1 +1,565 @@
-PLACEHOLDER_RELEASE_YML
+# =============================================================================
+# release.yml — OpenCode Android 双阶段 CI/CD (GitHub Actions)
+#               [P5.1 全自动冒烟改造, release-ops 付航远, 2026-10-07]
+#
+# 触发模型 (三路, 本次改造):
+#   1. push → main        : 全自动冒烟。推代码到 main 即自动跑 CI, 主理人全程零手动操作。
+#   2. push → tags v*     : 正式发布。完整口径, 全部硬断言生效, 产出 GitHub Release。
+#   3. workflow_dispatch  : 手动备用 (保留)。视同冒烟, 不发 Release。
+#
+# 冒烟 vs 发布差异矩阵:
+#   - 签名             : tag 缺签名 Secrets → 硬失败; 冒烟 → debug 兜底 (::warning + .debug-signed 标记)
+#   - debug-signed 断言: 仅 tag 硬失败; 冒烟降级 ::warning (改造点①)
+#   - smoke 断言 2/3   : adb install + libproot --version 仅 tag 硬断言; 冒烟因
+#                        arm64-v8a 单 ABI APK × x86_64-16k 模拟器 (NO_MATCHING_ABIS 已知边界)
+#                        降级 ::warning, 断言 2 失败则断言 3 一并跳过 (改造点②)
+#                        断言 1 (PAGESIZE=16384) 与模拟器启动与 ABI 无关, 任何运行均硬断言
+#   - job_release      : 仅 tag 运行启动 (job 级 if: startsWith(github.ref, 'refs/tags/v'))
+#
+# 失败诊断 artifact 化 (改造点③): job logs REST API 匿名 403, 匿名拉不到 step 日志;
+#   public repo artifact 下载 API 匿名可用 → job_snapshot / job_android 失败时上传构建日志
+#   (snapshot-logs-<run_id> / android-logs-<run_id>, retention 7 天)。gate 类短输出失败的
+#   ::error annotation 另经 check-runs annotations API 匿名可读。
+#   job_smoke_16kb 的 script 由 emulator-runner 托管, 不强加 tee, 失败诊断走 annotation 通道。
+#
+# 失败日志外带 ci-logs 分支 (改造点④): 实测匿名三路全堵 — artifact zip 下载 401 (Requires
+#   authentication)、UI artifact 端点 Not Found、job logs API 403 (Must have admin rights);
+#   而 public repo 的 raw.githubusercontent.com 分支文件匿名可读 → job_snapshot / job_android
+#   各加 if: failure() 的「Push logs to ci-logs branch」step: /tmp 下全新 git init -b ci-logs
+#   (全新 init 即天然 orphan, 首 commit 无 parent, 单 commit 历史干净无 merge 冲突) → 拷入
+#   本轮全部 tee 日志 (文件名统一带 run_id 前缀) + meta (run_id/run_number/attempt/job/SHA/
+#   event/ref + 路径映射) → git push --force 覆盖 ci-logs 分支。
+#   布局: 一层目录 snapshot/ 与 android/, 日志文件本体直接在目录下, 主理人匿名直拉:
+#     https://raw.githubusercontent.com/<owner>/<repo>/ci-logs/snapshot/<run_id>-meta.txt
+#     https://raw.githubusercontent.com/<owner>/<repo>/ci-logs/android/<run_id>-proot-build.log
+#   与改造点③并存 (artifact 为登录态冗余通道, ci-logs 为匿名主通道), 既有 artifact 上传与
+#   全部 gate/tee 逻辑零改动; 推送 step continue-on-error: true, 日志外带失败不掩盖/改写
+#   原有 job 失败, 且显式 ::error 提示。GITHUB_TOKEN 发起的 push 官方保证不触发 workflow
+#   (无递归风险); token 为短时凭证自动过期, GitHub 日志内自动打码 (***), 不入库不入 artifact。
+#   竞争分析: job_android needs job_snapshot → snapshot 失败则 android skip, 两 job 不会
+#   并发失败推送; force 覆盖为设计语义 (ci-logs 永远 = 最近一次失败 job 的日志, meta 的
+#   run_id 用于核对归属; 跨 run 亦然, 新失败 run 覆盖旧失败 run)。
+#
+# Re-run 语义: re-run 固定原 run 的 commit SHA (不拉新修复); 修复推送 main 自然触发新冒烟 run。
+# =============================================================================
+name: release
+
+on:
+  push:
+    branches: [main]        # 自动冒烟主触发: 推 main 即跑, 无需任何 token
+    tags: ["v*"]            # 正式发布入口 (P1 §5.5); branches 与 tags 为 OR 语义
+  workflow_dispatch: {}     # 手动触发备用: device-validator 冒烟入口, 视同冒烟不发 Release
+
+permissions:
+  contents: read            # 最小权限基线; job_snapshot/job_android/job_release 经 job 级 permissions 显式提权 (终裁 #4 拆分)
+
+env:
+  OC_VERSION: "1.18.34"     # 与 snapshot/build-snapshot.sh 默认值同一口径, 升级两处同步改
+
+jobs:
+  # ① job_snapshot: 快照构建 (arm64 原生 chroot)
+  job_snapshot:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    # [改造点④] job 级最小化提权: GITHUB_TOKEN 需 contents:write 才能 force push ci-logs
+    # 分支 (workflow 级基线 read-only, 不显式声明则 push 403)。job 级 permissions 完全覆盖
+    # workflow 级基线; 本 job 其余 step 与所用 action (checkout/upload-artifact) 均不消费
+    # 写权限, 提权面收敛到仅失败日志推送 step。
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build engine snapshot
+        run: |
+          set -o pipefail
+          chmod +x snapshot/build-snapshot.sh
+          OUT_DIR=dist ./snapshot/build-snapshot.sh "${OC_VERSION}" 2>&1 | tee build.log
+
+      - name: "Gate 2: snapshot size <= 160MiB"
+        run: |
+          SIZE=$(stat -c%s dist/oc-ubuntu-arm64.tar.gz)
+          MAX=167772160
+          echo "snapshot size = ${SIZE} bytes (gate = ${MAX})"
+          if [ "${SIZE}" -gt "${MAX}" ]; then
+            echo "::error::快照超体积门禁 ${SIZE} > ${MAX} 字节。先裁工具链 (P2a §1.3 优先级), 禁止静默放行"
+            exit 1
+          fi
+
+      - name: "Gate 3: manifest schema & consistency"
+        run: |
+          jq -e '
+            .schemaVersion == 1
+            and (.snapshotVersion | test("^[0-9]{8}-oc"))
+            and .ocVersion == $oc
+            and (.ubuntuBase | length > 0)
+            and .file == "oc-ubuntu-arm64.tar.gz"
+            and (.sha256 | test("^[0-9a-f]{64}$"))
+            and (.size | type == "number" and . > 0)
+            and .format == "tar.gz"
+            and .layout == "rootfs-at-tar-root"
+            and .excludes == ["./workspace", "./root/.local/share/opencode"]
+            and (.minAppVersion | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+          ' --arg oc "${OC_VERSION}" dist/manifest.json > /dev/null \
+            || { echo "::error::manifest.json 未通过 C1 字段完整性断言 (P1 §3.1)"; exit 1; }
+          EXPECTED_SHA=$(jq -r .sha256 dist/manifest.json)
+          ACTUAL_SHA=$(sha256sum dist/oc-ubuntu-arm64.tar.gz | cut -d' ' -f1)
+          [ "${EXPECTED_SHA}" = "${ACTUAL_SHA}" ] \
+            || { echo "::error::sha256 不一致: manifest=${EXPECTED_SHA} actual=${ACTUAL_SHA}"; exit 1; }
+          EXPECTED_SIZE=$(jq -r .size dist/manifest.json)
+          ACTUAL_SIZE=$(stat -c%s dist/oc-ubuntu-arm64.tar.gz)
+          [ "${EXPECTED_SIZE}" = "${ACTUAL_SIZE}" ] \
+            || { echo "::error::size 不一致: manifest=${EXPECTED_SIZE} actual=${ACTUAL_SIZE}"; exit 1; }
+          echo "gate 3 PASS: oc=${OC_VERSION} sha256=${ACTUAL_SHA} size=${ACTUAL_SIZE}"
+
+      - name: Verify snapshot smoke (tar 可读 + opencode 二进制存在)
+        run: |
+          test -f dist/oc-ubuntu-arm64.tar.gz
+          tar -tzf dist/oc-ubuntu-arm64.tar.gz | grep -q './usr/local/bin/opencode'
+          test -f dist/manifest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshot
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      # --- 改造点③: 失败日志 artifact 化 (匿名可拉) ------------------------------
+      - name: Collect failure diagnostics (best-effort)
+        if: failure()
+        run: |
+          set +e
+          mkdir -p diag
+          [ -f build.log ] && cp -f build.log diag/
+          [ -f /tmp/setup.sh ] && cp -f /tmp/setup.sh diag/
+          du -sh /tmp/* 2>/dev/null | sort -h | tail -n 30 > diag/tmp-usage.txt
+          echo "diag/:"; ls -l diag/
+
+      - name: Upload failure logs (主理人匿名可拉)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-logs-${{ github.run_id }}
+          path: |
+            build.log
+            diag/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # --- 改造点④: 失败日志外带 ci-logs 分支 (raw.githubusercontent.com 匿名直拉) ---
+      # 与改造点③ artifact 通道并存; tee 落点 = 工作区根 build.log + diag/ 两诊断文件
+      # (Collect failure diagnostics 产出), 拷贝口径与 Upload failure logs 的 path 一致。
+      - name: Push logs to ci-logs branch
+        if: failure()
+        continue-on-error: true        # 日志外带失败不得掩盖/改写原有失败原因
+        run: |
+          set -u
+          PFX="${GITHUB_RUN_ID}"
+          LOGREPO="$(mktemp -d)/ci-logs"
+          JOB_DIR="snapshot"
+          git init -q -b ci-logs "${LOGREPO}"    # 全新 init = 天然 orphan (首 commit 无 parent)
+          mkdir -p "${LOGREPO}/${JOB_DIR}"
+
+          # 1) meta 文件: 无条件生成, 保证 commit 非空; 记录 run 定位信息与路径映射
+          {
+            echo "OpenCode Android CI 失败日志元信息 (ci-logs 分支, orphan 覆盖式推送)"
+            echo "run_id      : ${GITHUB_RUN_ID}"
+            echo "run_number  : ${GITHUB_RUN_NUMBER}"
+            echo "run_attempt : ${GITHUB_RUN_ATTEMPT}"
+            echo "job         : ${GITHUB_JOB} (job_snapshot, ubuntu-24.04-arm)"
+            echo "commit_sha  : ${GITHUB_SHA}"
+            echo "event       : ${GITHUB_EVENT_NAME}"
+            echo "ref         : ${GITHUB_REF} (type=${GITHUB_REF_TYPE}, name=${GITHUB_REF_NAME})"
+            echo "oc_version  : ${OC_VERSION}"
+            echo "pushed_at   : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo ""
+            echo "路径映射 (runner 工作区 ${GITHUB_WORKSPACE} → 本分支 ${JOB_DIR}/):"
+            echo "  build.log          → ${JOB_DIR}/${PFX}-snapshot-build.log (存在时)"
+            echo "  diag/tmp-usage.txt → ${JOB_DIR}/${PFX}-diag-tmp-usage.txt (存在时)"
+            echo "  diag/setup.sh      → ${JOB_DIR}/${PFX}-diag-setup.sh (存在时)"
+            echo ""
+            echo "说明: 本分支永远只保留最近一次失败 job 的日志 (force 覆盖语义)。"
+            echo "若本 run 实际失败在 job_android, 则 snapshot/ 下无日志属预期 (整分支被 android/ 覆盖)。"
+          } > "${LOGREPO}/${JOB_DIR}/${PFX}-meta.txt"
+
+          # 2) 拷贝本轮全部 tee 日志 (存在才拷; 与 Upload failure logs artifact 口径一致)
+          if [ -f build.log ];          then cp -f build.log          "${LOGREPO}/${JOB_DIR}/${PFX}-snapshot-build.log";  fi
+          if [ -f diag/tmp-usage.txt ]; then cp -f diag/tmp-usage.txt "${LOGREPO}/${JOB_DIR}/${PFX}-diag-tmp-usage.txt"; fi
+          if [ -f diag/setup.sh ];      then cp -f diag/setup.sh      "${LOGREPO}/${JOB_DIR}/${PFX}-diag-setup.sh";      fi
+
+          # 3) commit + force push (GITHUB_TOKEN push 官方保证不触发 workflow; 失败显式提示)
+          git -C "${LOGREPO}" config user.name  "ci-logs-bot"
+          git -C "${LOGREPO}" config user.email "ci-logs-bot@users.noreply.github.com"
+          git -C "${LOGREPO}" add -A
+          if git -C "${LOGREPO}" commit -q -m "ci-logs: run ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT} job ${GITHUB_JOB} (failure)" \
+             && git -C "${LOGREPO}" push --force -q \
+                  "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ci-logs; then
+            echo "ci-logs 推送成功, 匿名拉取入口 (主理人零凭证):"
+            echo "  https://raw.githubusercontent.com/${{ github.repository }}/ci-logs/${JOB_DIR}/${PFX}-meta.txt"
+            echo "  https://raw.githubusercontent.com/${{ github.repository }}/ci-logs/${JOB_DIR}/${PFX}-snapshot-build.log"
+          else
+            echo "::error::ci-logs 分支 commit/push 失败 — raw 匿名通道本次不可用; 登录态改走 artifact 通道: snapshot-logs-${GITHUB_RUN_ID}"
+          fi
+
+  # ② job_android: 原生两库 NDK 编译 + 双变体签名 APK
+  job_android:
+    needs: job_snapshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # [改造点④] job 级最小化提权: GITHUB_TOKEN 需 contents:write 才能 force push ci-logs
+    # 分支 (workflow 级基线 read-only, 不显式声明则 push 403)。job 级 permissions 完全覆盖
+    # workflow 级基线; 本 job 其余 step 与所用 action (setup-java/setup-gradle/setup-android/
+    # download-upload-artifact) 均不消费写权限, 提权面收敛到仅失败日志推送 step。
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17", cache: gradle }
+
+      - name: Setup Gradle 8.7 (wrapper-bootstrap toolchain, cache handled by setup-java)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+          cache-disabled: true
+
+      # [run#4 修复] v3 默认 packages="tools platform-tools", Google 已下架 legacy "tools" 包
+      # → sdkmanager "Failed to find package 'tools'" 退出码 1 → step 失败 (同源案例 OmniBot PR #535)。
+      # 升级官方修复版 v4: 默认 packages 仅 platform-tools / cmdline-tools 22.0 / 请求 tools 仅 warning;
+      # 且始终预接受 SDK license, 为 AGP 未来缺组件自动安装兜底 (当前构建链不触发 sdkmanager)。
+      # 本 step 未传任何 with: 输入, v3→v4 为零适配 drop-in; ANDROID_HOME 由 runner 镜像注入, 不依赖本 action。
+      - uses: android-actions/setup-android@v4
+
+      - name: Locate NDK (供 native 两脚本与 gate ① 使用)
+        run: |
+          NDK_DIR="$(ls -d "${ANDROID_HOME}/ndk"/* 2>/dev/null | sort -V | tail -n1)"
+          [ -n "${NDK_DIR}" ] || { echo "::error::runner 未预装 Android NDK"; exit 1; }
+          echo "NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "NDK: ${NDK_DIR}"
+
+      - name: Install build deps (qemu meson 构建链)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config ninja-build
+
+      - uses: actions/download-artifact@v4
+        with: { name: snapshot, path: dist/ }
+
+      - name: Derive app version from tag
+        run: |
+          APP_VERSION_NAME="${GITHUB_REF_NAME#v}"
+          if ! [[ "${APP_VERSION_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::非 vX.Y.Z tag (branch push 冒烟 / 手动触发), APK 版本号回落 0.0.0-local"
+            APP_VERSION_NAME="0.0.0-local"
+          fi
+          IFS=. read -r VMA VMI VPA <<< "${APP_VERSION_NAME}"
+          echo "APP_VERSION_NAME=${APP_VERSION_NAME}"          >> "$GITHUB_ENV"
+          echo "APP_VERSION_CODE=$(( 10#$VMA * 1000000 + 10#$VMI * 1000 + 10#$VPA ))" >> "$GITHUB_ENV"
+
+      - name: "Release blocker: third-party SHA256 must be configured"
+        run: |
+          MISSING="$(grep -E \
+            -e '^ZLIB_SHA256="\$\{ZLIB_SHA256:-\}"$' \
+            -e '^LIBICONV_SHA256="\$\{LIBICONV_SHA256:-\}"$' \
+            -e '^PCRE2_SHA256="\$\{PCRE2_SHA256:-\}"$' \
+            -e '^GLIB_SHA256="\$\{GLIB_SHA256:-\}"$' \
+            native/build-qemu-user-static.sh | cut -d= -f1 || true)"
+          if [ -n "${MISSING}" ]; then
+            echo "::error::发布阻断 (P2b §7-1): 以下第三方依赖 SHA256 仍为空, 处于不可发布状态:"
+            echo "${MISSING}" | sed 's/^/    /'
+            echo "  补齐: 在 native/build-qemu-user-static.sh 填默认值 (核对 zlib.net fossils /"
+            echo "  ftp.gnu.org / PCRE2 GitHub Releases / download.gnome.org), 或改经 CI 环境变量注入并同步调整本 step"
+            exit 1
+          fi
+
+      - name: Build host binaries (proot + qemu-user, 16KB aligned)
+        run: |
+          set -o pipefail
+          bash native/build-proot.sh 2>&1 | tee proot-build.log
+          bash native/build-qemu-user-static.sh 2>&1 | tee qemu-build.log
+          ls -l app/src/main/jniLibs/arm64-v8a/
+
+      - name: "Gate 1: 16KB page alignment (check-page-align.sh)"
+        run: |
+          READELF="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          LIBS=(app/src/main/jniLibs/arm64-v8a/*.so)
+          [ -e "${LIBS[0]}" ] || { echo "::error::jniLibs 无产物, 两库编译未落位"; exit 1; }
+          READELF="${READELF}" bash native/check-page-align.sh "${LIBS[@]}"
+
+      - name: Inject snapshot into full variant assets
+        run: |
+          mkdir -p app/src/full/assets/snapshot
+          cp dist/oc-ubuntu-arm64.tar.gz dist/manifest.json app/src/full/assets/snapshot/
+          ls -l app/src/full/assets/snapshot/
+
+      - name: Check gradle wrapper committed
+        run: |
+          if [ -x ./gradlew ]; then
+            echo "gradle wrapper 已入仓, 原样使用"
+          else
+            echo "::warning::gradlew 未入仓, 由 CI 用 setup-gradle 安装的 gradle 自动生成 wrapper (8.7)"
+            gradle wrapper --gradle-version 8.7 --no-daemon
+            test -x ./gradlew || { echo "::error::wrapper 自动生成失败 (./gradlew 不可执行)"; exit 1; }
+            grep -q 'gradle-8\.7-bin' gradle/wrapper/gradle-wrapper.properties \
+              || { echo "::error::gradle-wrapper.properties 未锁定 8.7 (版本漂移防护), 中止"; exit 1; }
+            echo "wrapper 已生成: gradlew + gradle/wrapper/* (distributionUrl=gradle-8.7-bin.zip), 后续构建经 ./gradlew 执行"
+          fi
+
+      - name: Restore keystore & build signed APKs (full/lite)
+        env:
+          KEYSTORE_BASE64:  ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_BASE64}" ]; then
+            KS="${RUNNER_TEMP}/release.keystore"
+            echo "${KEYSTORE_BASE64}" | base64 -d > "${KS}"
+            export CI_KEYSTORE_FILE="${KS}"
+            export CI_KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD}"
+            export CI_KEY_ALIAS="${KEY_ALIAS}"
+            export CI_KEY_PASSWORD="${KEY_PASSWORD}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::tag 发布缺少签名 Secrets (KEYSTORE_BASE64 等), 拒绝产出不可发布物"; exit 1
+          else
+            echo "::warning::未配置签名 Secrets, 本次按 debug 签名兜底 (冒烟运行: branch push / workflow_dispatch; 产物仅限冒烟验证, 禁止对外分发)"
+            echo "debug-signed" > "${RUNNER_TEMP}/.debug-signed"
+          fi
+          set -o pipefail
+          ./gradlew :app:assembleFullRelease :app:assembleLiteRelease 2>&1 | tee gradle-build.log
+
+      - name: "Gate 4: extractNativeLibs=true in APK manifest"
+        run: |
+          AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
+          RC=0
+          for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
+            LINE="$($"$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            echo "${apk}: ${LINE:-<attribute absent>}"
+            echo "${LINE}" | grep -q '"true"' || {
+              echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
+              RC=1; }
+          done
+          exit ${RC}
+
+      - name: "Gate 1b: packaged .so alignment recheck (from APK)"
+        run: |
+          READELF="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          TMP="$(mktemp -d)"
+          RC=0
+          for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
+            unzip -q -j "${apk}" 'lib/arm64-v8a/libproot.so' 'lib/arm64-v8a/libqemu_aarch64.so' -d "${TMP}/pkg" \
+              || { echo "::error::APK 内缺 libproot.so/libqemu_aarch64.so: ${apk}"; RC=1; continue; }
+            READELF="${READELF}" bash native/check-page-align.sh "${TMP}"/pkg/*.so || RC=1
+          done
+          rm -rf "${TMP}"; exit ${RC}
+
+      - name: Assert release bundle (四件套齐备 + 传输后完整性复核)
+        run: |
+          N_FULL=$(ls app/build/outputs/apk/full/release/*.apk | wc -l)
+          N_LITE=$(ls app/build/outputs/apk/lite/release/*.apk | wc -l)
+          [ "${N_FULL}" -eq 1 ] || { echo "::error::full 变体应恰有 1 个 APK, 实得 ${N_FULL}"; exit 1; }
+          [ "${N_LITE}" -eq 1 ] || { echo "::error::lite 变体应恰有 1 个 APK, 实得 ${N_LITE}"; exit 1; }
+          for f in app/build/outputs/apk/full/release/*.apk \
+                   app/build/outputs/apk/lite/release/*.apk \
+                   dist/oc-ubuntu-arm64.tar.gz dist/manifest.json; do
+            [ -s "${f}" ] || { echo "::error::发布产物缺失或为空: ${f}"; exit 1; }
+          done
+          EXPECTED_SHA=$(jq -r .sha256 dist/manifest.json)
+          ACTUAL_SHA=$(sha256sum dist/oc-ubuntu-arm64.tar.gz | cut -d' ' -f1)
+          [ "${EXPECTED_SHA}" = "${ACTUAL_SHA}" ] \
+            || { echo "::error::传输后 sha256 失配: manifest=${EXPECTED_SHA} actual=${ACTUAL_SHA}"; exit 1; }
+          jq -e --arg oc "${OC_VERSION}" '.ocVersion == $oc' dist/manifest.json > /dev/null \
+            || { echo "::error::manifest.ocVersion != ${OC_VERSION}, 快照与流水线版本漂移"; exit 1; }
+          if [ -f "${RUNNER_TEMP}/.debug-signed" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "::error::产物为 debug 签名, tag 发布禁止 (正常路径在构建步已拦, 此为双保险)"; exit 1
+            else
+              echo "::warning::产物为 debug 签名 (冒烟运行无签名 Secrets, 预期行为; 产物仅限冒烟验证, 禁止对外分发)"
+            fi
+          fi
+          echo "四件套齐备: $(ls app/build/outputs/apk/full/release/*.apk) / $(ls app/build/outputs/apk/lite/release/*.apk) / dist/oc-ubuntu-arm64.tar.gz / dist/manifest.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: |
+            app/build/outputs/apk/full/release/*.apk
+            app/build/outputs/apk/lite/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # --- 改造点③: 失败日志 artifact 化 (匿名可拉) ------------------------------
+      - name: Upload failure logs (主理人匿名可拉)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-logs-${{ github.run_id }}
+          path: |
+            proot-build.log
+            qemu-build.log
+            gradle-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # --- 改造点④: 失败日志外带 ci-logs 分支 (raw.githubusercontent.com 匿名直拉) ---
+      # 与 job_snapshot 同机制; 本 job tee 日志 = proot-build.log / qemu-build.log /
+      # gradle-build.log (均在工作区根)。proot 编译失败 (如 run#5) 时 qemu/gradle 两日志
+      # 不存在属预期 (pipefail 中断同 run 块后续行), 故逐文件存在性拷贝, meta 内写全映射。
+      - name: Push logs to ci-logs branch
+        if: failure()
+        continue-on-error: true        # 日志外带失败不得掩盖/改写原有失败原因
+        run: |
+          set -u
+          PFX="${GITHUB_RUN_ID}"
+          LOGREPO="$(mktemp -d)/ci-logs"
+          JOB_DIR="android"
+          git init -q -b ci-logs "${LOGREPO}"    # 全新 init = 天然 orphan (首 commit 无 parent)
+          mkdir -p "${LOGREPO}/${JOB_DIR}"
+
+          # 1) meta 文件: 无条件生成, 保证 commit 非空; 记录 run 定位信息与路径映射
+          {
+            echo "OpenCode Android CI 失败日志元信息 (ci-logs 分支, orphan 覆盖式推送)"
+            echo "run_id      : ${GITHUB_RUN_ID}"
+            echo "run_number  : ${GITHUB_RUN_NUMBER}"
+            echo "run_attempt : ${GITHUB_RUN_ATTEMPT}"
+            echo "job         : ${GITHUB_JOB} (job_android, ubuntu-24.04 x86_64)"
+            echo "commit_sha  : ${GITHUB_SHA}"
+            echo "event       : ${GITHUB_EVENT_NAME}"
+            echo "ref         : ${GITHUB_REF} (type=${GITHUB_REF_TYPE}, name=${GITHUB_REF_NAME})"
+            echo "oc_version  : ${OC_VERSION}"
+            echo "ndk_root    : ${NDK_ROOT:-<unset>}"
+            echo "app_version : ${APP_VERSION_NAME:-<unset>}"
+            echo "pushed_at   : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo ""
+            echo "路径映射 (runner 工作区 ${GITHUB_WORKSPACE} → 本分支 ${JOB_DIR}/):"
+            echo "  proot-build.log   → ${JOB_DIR}/${PFX}-proot-build.log (存在时)"
+            echo "  qemu-build.log    → ${JOB_DIR}/${PFX}-qemu-build.log (存在时)"
+            echo "  gradle-build.log  → ${JOB_DIR}/${PFX}-gradle-build.log (存在时)"
+            echo ""
+            echo "说明: 本分支永远只保留最近一次失败 job 的日志 (force 覆盖语义)。"
+            echo "gate 类 step (无 tee) 的失败详情走 ::error annotation (check-runs 匿名可读)。"
+          } > "${LOGREPO}/${JOB_DIR}/${PFX}-meta.txt"
+
+          # 2) 拷贝本轮全部 tee 日志 (存在才拷; 与 Upload failure logs artifact 口径一致)
+          if [ -f proot-build.log ];  then cp -f proot-build.log  "${LOGREPO}/${JOB_DIR}/${PFX}-proot-build.log";  fi
+          if [ -f qemu-build.log ];   then cp -f qemu-build.log   "${LOGREPO}/${JOB_DIR}/${PFX}-qemu-build.log";   fi
+          if [ -f gradle-build.log ]; then cp -f gradle-build.log "${LOGREPO}/${JOB_DIR}/${PFX}-gradle-build.log"; fi
+
+          # 3) commit + force push (GITHUB_TOKEN push 官方保证不触发 workflow; 失败显式提示)
+          git -C "${LOGREPO}" config user.name  "ci-logs-bot"
+          git -C "${LOGREPO}" config user.email "ci-logs-bot@users.noreply.github.com"
+          git -C "${LOGREPO}" add -A
+          if git -C "${LOGREPO}" commit -q -m "ci-logs: run ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT} job ${GITHUB_JOB} (failure)" \
+             && git -C "${LOGREPO}" push --force -q \
+                  "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ci-logs; then
+            echo "ci-logs 推送成功, 匿名拉取入口 (主理人零凭证):"
+            echo "  https://raw.githubusercontent.com/${{ github.repository }}/ci-logs/${JOB_DIR}/${PFX}-meta.txt"
+            echo "  https://raw.githubusercontent.com/${{ github.repository }}/ci-logs/${JOB_DIR}/${PFX}-proot-build.log"
+            echo "  https://raw.githubusercontent.com/${{ github.repository }}/ci-logs/${JOB_DIR}/${PFX}-gradle-build.log"
+          else
+            echo "::error::ci-logs 分支 commit/push 失败 — raw 匿名通道本次不可用; 登录态改走 artifact 通道: android-logs-${GITHUB_RUN_ID}"
+          fi
+
+  # ③ job_smoke_16kb: 16KB 模拟器冒烟
+  # 已知边界 (改造点②): full APK 为 arm64-v8a 单 ABI, 装入 x86_64-16k 模拟器必
+  # INSTALL_FAILED_NO_MATCHING_ABIS。tag 运行 = 硬断言 (发布口径); 冒烟运行 = 降级 ::warning,
+  # 断言 2 (安装) 失败则断言 3 (libproot --version) 一并跳过。断言 1 (PAGESIZE) 与模拟器启动
+  # 与 ABI 无关, 任何运行均硬断言。
+  job_smoke_16kb:
+    needs: [job_android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+
+      - uses: actions/download-artifact@v4
+        with: { name: apks, path: apks/ }
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64-16k
+          emulator-options: >-
+            -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          script: |
+            adb wait-for-device
+            BOOT=""
+            for i in $(seq 1 60); do
+              BOOT="$(adb shell getprop sys.boot_completed | tr -d '\r')"
+              if [ "${BOOT}" = "1" ]; then break; fi
+              sleep 5
+            done
+            if [ "${BOOT}" != "1" ]; then
+              echo "::error::模拟器 300s 内未完成启动 (sys.boot_completed != 1)"; exit 1
+            fi
+            PAGESIZE="$(adb shell getconf PAGESIZE | tr -d '\r')"
+            echo "PAGESIZE = ${PAGESIZE}"
+            if [ "${PAGESIZE}" != "16384" ]; then
+              echo "::error::PAGESIZE=${PAGESIZE} != 16384, 非 16KB page 镜像 (C3 第 3 项)"; exit 1
+            fi
+            # 断言 2/3 硬度开关: tag=1 硬断言; 冒烟 (branch push / workflow_dispatch)=0 降级 warning
+            HARD=0
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then HARD=1; fi
+            APK="$(ls apks/full/release/*.apk)"
+            INSTALL_OK=1
+            if ! adb install -r "${APK}"; then
+              INSTALL_OK=0
+              if [ "${HARD}" = "1" ]; then
+                echo "::error::full APK 安装失败: ${APK} (NO_MATCHING_ABIS 见 job 头注释已知边界)"; exit 1
+              fi
+              echo "::warning::full APK 安装失败: ${APK} — arm64-v8a 单 ABI APK 与 x86_64-16k 模拟器 ABI 不匹配 (NO_MATCHING_ABIS, 已知边界), 冒烟降级不阻断"
+            fi
+            if [ "${INSTALL_OK}" = "1" ]; then
+              PROOT_LIB="$(adb shell "ls /data/app/*/lib/arm64/libproot.so 2>/dev/null" | tr -d '\r' | head -n1)"
+              if [ -z "${PROOT_LIB}" ]; then
+                if [ "${HARD}" = "1" ]; then
+                  echo "::error::设备上未找到解包后的 libproot.so (D4 落位异常?)"; exit 1
+                fi
+                echo "::warning::设备上未找到解包后的 libproot.so (D4 落位异常?) — 冒烟降级不阻断"
+              else
+                echo "libproot = ${PROOT_LIB}"
+                if ! adb shell "${PROOT_LIB} --version"; then
+                  if [ "${HARD}" = "1" ]; then
+                    echo "::error::libproot.so --version FAIL (16KB 内核加载/运行时自足不通过)"; exit 1
+                  fi
+                  echo "::warning::libproot.so --version FAIL (16KB 内核加载/运行时自足不通过) — 冒烟降级不阻断"
+                fi
+              fi
+            else
+              echo "::warning::跳过 libproot.so 落位与 --version 断言 (前置安装失败, 冒烟降级)"
+            fi
+            echo "smoke 完成 (HARD=${HARD})"
+
+  # ④ job_release: GitHub Release 发布 (仅 tag 运行; 冒烟运行在本 job 级 if 直接 skip)
+  # job 级 if 与 needs 交互: needs 前置失败时默认 skip (if 内未用 failure()/always() 状态函数),
+  # 不会因 ref 匹配 tag 而带病启动 → 语义收敛为「tag 且上游全绿才发布」。
+  job_release:
+    needs: [job_android, job_smoke_16kb]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: snapshot, path: dist/ }
+      - uses: actions/download-artifact@v4
+        with: { name: apks, path: apks/ }
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')   # 双保险保留 (job 级 if 已拦, 此处防误配)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apks/full/release/*.apk
+            apks/lite/release/*.apk
+            dist/oc-ubuntu-arm64.tar.gz
+            dist/manifest.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
