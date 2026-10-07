@@ -335,7 +335,7 @@ jobs:
           AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
           RC=0
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
-            LINE="$($"$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            LINE="$("$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
             echo "${apk}: ${LINE:-<attribute absent>}"
             echo "${LINE}" | grep -q '"true"' || {
               echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
