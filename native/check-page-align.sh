@@ -65,6 +65,9 @@ else
 fi
 [[ $MIN_VAL -gt 0 ]] || die "非法 --min-align: $MIN_ALIGN"
 
+# readelf -lW 封装：失败静默返回空（|| true 防 pipefail 中断），输出交 awk 解析
+readelf_lw() { "$READELF" -lW "$1" 2>/dev/null || true; }
+
 # ───────────────────────────── 逐文件校验 ────────────────────────────────────
 FAIL_TOTAL=0
 for f in "$@"; do
@@ -90,7 +93,7 @@ for f in "$@"; do
   #      每条 LOAD 段单独判定，逐段全部达标（修复原缺陷 ①③）。
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    offset="${line%% *}" 
+    offset="${line%% *}"
     align_raw="${line##* }"
     if [[ "$align_raw" == 0x* || "$align_raw" == 0X* ]]; then
       align_val=$((align_raw))
@@ -102,13 +105,17 @@ for f in "$@"; do
              "$offset" "$align_raw" "$align_val" "$MIN_VAL"
       fail=1
     fi
-  done < <("$READELF" -lW "$f" 2>/dev/null | awk '
+  done < <(readelf_lw "$f" | awk '
     /^Program Headers:/              { in_ph = 1; next }
     /^ *Section to Segment mapping:/ { in_ph = 0 }
     in_ph && $1 == "LOAD"            { print $2, $NF }
   ')
 
-  load_cnt="$($READ_ELF_LOAD_COUNT)"
+  load_cnt="$(readelf_lw "$f" | awk '
+    /^Program Headers:/              { in_ph = 1; next }
+    /^ *Section to Segment mapping:/ { in_ph = 0 }
+    in_ph && $1 == "LOAD"            { n++ } END { print n+0 }
+  ')"
   if [[ "$load_cnt" -eq 0 ]]; then
     echo "  [FAIL] 未解析到任何 LOAD 段（文件非 ELF 或 readelf 输出格式不符）"
     fail=1
