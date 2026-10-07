@@ -108,11 +108,7 @@ for f in "$@"; do
     in_ph && $1 == "LOAD"            { print $2, $NF }
   ')
 
-  load_cnt="$EREADELF_PLACEHOLDER" 2>/dev/null | awk '
-    /^Program Headers:/              { in_ph = 1; next }
-    /^ *Section to Segment mapping:/ { in_ph = 0 }
-    in_ph && $1 == "LOAD"            { n++ } END { print n+0 }
-  ')"
+  load_cnt="$($READ_ELF_LOAD_COUNT)"
   if [[ "$load_cnt" -eq 0 ]]; then
     echo "  [FAIL] 未解析到任何 LOAD 段（文件非 ELF 或 readelf 输出格式不符）"
     fail=1
