@@ -291,7 +291,8 @@ QEMU_BIN="$QEMU_DIR/build/qemu-aarch64"
   || die "架构断言失败：产物不是 AArch64"
 
 # (b) C3 静态断言：NEEDED 必须为 0
-NEEDED="$($READELF" -d "$QEMU_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
+readelf_dyn() { "$READELF" -d "$1" 2>/dev/null || true; }
+NEEDED="$(readelf_dyn "$QEMU_BIN" | awk '/NEEDED/{print}')"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3 --static）：
 $NEEDED"

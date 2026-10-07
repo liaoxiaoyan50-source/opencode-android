@@ -231,7 +231,8 @@ PROOT_BIN="$PROOT_DIR/src/proot"
   || die "架构断言失败：产物不是 AArch64"
 
 # (b) C3 静态断言：NEEDED 必须为 0（零额外 .so 依赖）
-NEEDED="$($READELF" -d "$PROOT_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
+readelf_dyn() { "$READELF" -d "$1" 2>/dev/null || true; }
+NEEDED="$(readelf_dyn "$PROOT_BIN" | awk '/NEEDED/{print}')"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3）：
 $NEEDED"
