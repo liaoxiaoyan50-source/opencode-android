@@ -14,6 +14,8 @@
 #   * 签名: Secrets (KEYSTORE_BASE64/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD) 经
 #     base64 -d 还原后以 CI_KEYSTORE_* 环境变量交给 app/build.gradle.kts; 无 Secrets 时
 #     tag 发布硬失败, workflow_dispatch 冒烟回落 debug 签名(见 P5 §3)
+#   * gradle wrapper 兜底: 未入仓时由 setup-gradle(8.7) 自举生成 (release-ops 收尾补丁,
+#     cache-disabled 避让 setup-java cache:gradle; 已入仓则原样使用)
 #
 # 版本策略: tag v* 触发正式发布; snapshotVersion = 构建日(UTC)+oc<OC_VERSION>
 #           (build-snapshot.sh 口径); APK versionName = tag 去 v 前缀;
@@ -110,6 +112,12 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17", cache: gradle }
 
+      - name: Setup Gradle 8.7 (wrapper-bootstrap toolchain, cache handled by setup-java)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"   # 官方文档要求引号, 防 YAML 解析为 number
+          cache-disabled: true    # setup-java cache: gradle 已独占 ~/.gradle/caches, 双开即双重缓存冲突
+
       - uses: android-actions/setup-android@v3
 
       - name: Locate NDK (供 native 两脚本与 gate ① 使用)
@@ -143,10 +151,10 @@ jobs:
       - name: "Release blocker: third-party SHA256 must be configured"
         run: |
           MISSING="$(grep -E \
-            -e '^ZLIB_SHA256="\$\{ZLIB_SHA256:-\}"$' \
-            -e '^LIBICONV_SHA256="\$\{LIBICONV_SHA256:-\}"$' \
-            -e '^PCRE2_SHA256="\$\{PCRE2_SHA256:-\}"$' \
-            -e '^GLIB_SHA256="\$\{GLIB_SHA256:-\}"$' \
+            -e '^ZLIB_SHA256="\\$\\{ZLIB_SHA256:-\\}"$' \
+            -e '^LIBICONV_SHA256="\\$\\{LIBICONV_SHA256:-\\}"$' \
+            -e '^PCRE2_SHA256="\\$\\{PCRE2_SHA256:-\\}"$' \
+            -e '^GLIB_SHA256="\\$\\{GLIB_SHA256:-\\}"$' \
             native/build-qemu-user-static.sh | cut -d= -f1 || true)"
           if [ -n "${MISSING}" ]; then
             echo "::error::发布阻断 (P2b §7-1): 以下第三方依赖 SHA256 仍为空, 处于不可发布状态:"
@@ -182,7 +190,16 @@ jobs:
 
       - name: Check gradle wrapper committed
         run: |
-          test -x ./gradlew || { echo "::error::gradle wrapper 未入仓 (须提交 gradlew + gradle/wrapper/*); 首次接入: gradle wrapper --gradle-version 8.7"; exit 1; }
+          if [ -x ./gradlew ]; then
+            echo "gradle wrapper 已入仓, 原样使用"
+          else
+            echo "::warning::gradlew 未入仓, 由 CI 用 setup-gradle 安装的 gradle 自动生成 wrapper (8.7)"
+            gradle wrapper --gradle-version 8.7 --no-daemon
+            test -x ./gradlew || { echo "::error::wrapper 自动生成失败 (./gradlew 不可执行)"; exit 1; }
+            grep -q 'gradle-8\\.7-bin' gradle/wrapper/gradle-wrapper.properties \
+              || { echo "::error::gradle-wrapper.properties 未锁定 8.7 (版本漂移防护), 中止"; exit 1; }
+            echo "wrapper 已生成: gradlew + gradle/wrapper/* (distributionUrl=gradle-8.7-bin.zip), 后续构建经 ./gradlew 执行"
+          fi
 
       # ── 签名 + 双变体出包 (Secrets → base64 -d 还原 → CI_KEYSTORE_* 环境变量) ──
       - name: Restore keystore & build signed APKs (full/lite)
@@ -213,7 +230,7 @@ jobs:
           AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
           RC=0
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
-            LINE="$($"$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            LINE="$('$AAPT2' dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
             echo "${apk}: ${LINE:-<attribute absent>}"
             echo "${LINE}" | grep -q '"true"' || {
               echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
