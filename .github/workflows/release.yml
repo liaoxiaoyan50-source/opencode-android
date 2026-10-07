@@ -151,10 +151,10 @@ jobs:
       - name: "Release blocker: third-party SHA256 must be configured"
         run: |
           MISSING="$(grep -E \
-            -e '^ZLIB_SHA256="\\$\\{ZLIB_SHA256:-\\}"$' \
-            -e '^LIBICONV_SHA256="\\$\\{LIBICONV_SHA256:-\\}"$' \
-            -e '^PCRE2_SHA256="\\$\\{PCRE2_SHA256:-\\}"$' \
-            -e '^GLIB_SHA256="\\$\\{GLIB_SHA256:-\\}"$' \
+            -e '^ZLIB_SHA256="\$\{ZLIB_SHA256:-\}"$' \
+            -e '^LIBICONV_SHA256="\$\{LIBICONV_SHA256:-\}"$' \
+            -e '^PCRE2_SHA256="\$\{PCRE2_SHA256:-\}"$' \
+            -e '^GLIB_SHA256="\$\{GLIB_SHA256:-\}"$' \
             native/build-qemu-user-static.sh | cut -d= -f1 || true)"
           if [ -n "${MISSING}" ]; then
             echo "::error::发布阻断 (P2b §7-1): 以下第三方依赖 SHA256 仍为空, 处于不可发布状态:"
@@ -196,7 +196,7 @@ jobs:
             echo "::warning::gradlew 未入仓, 由 CI 用 setup-gradle 安装的 gradle 自动生成 wrapper (8.7)"
             gradle wrapper --gradle-version 8.7 --no-daemon
             test -x ./gradlew || { echo "::error::wrapper 自动生成失败 (./gradlew 不可执行)"; exit 1; }
-            grep -q 'gradle-8\\.7-bin' gradle/wrapper/gradle-wrapper.properties \
+            grep -q 'gradle-8\.7-bin' gradle/wrapper/gradle-wrapper.properties \
               || { echo "::error::gradle-wrapper.properties 未锁定 8.7 (版本漂移防护), 中止"; exit 1; }
             echo "wrapper 已生成: gradlew + gradle/wrapper/* (distributionUrl=gradle-8.7-bin.zip), 后续构建经 ./gradlew 执行"
           fi
@@ -230,7 +230,7 @@ jobs:
           AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
           RC=0
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
-            LINE="$('$AAPT2' dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            LINE="$("$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
             echo "${apk}: ${LINE:-<attribute absent>}"
             echo "${LINE}" | grep -q '"true"' || {
               echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
