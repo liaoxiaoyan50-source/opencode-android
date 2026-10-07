@@ -1,0 +1,369 @@
+# =============================================================================
+# release.yml — OpenCode Android 双阶段 CI/CD (GitHub Actions)  [P5 修订版, release-ops]
+#
+# 契约依据: team-output/P1-架构总纲.md §5.5(CI 拓扑)/§3.3(C3 四项校验)/§3.1(C1 manifest)/
+#           D3(体积门禁)/D4(useLegacyPackaging); P2a §3.1(gate 对接片段); P2b §3/§4/§7-1
+#
+# 相对骨架的修订 (P1 §7-2/§7-3):
+#   * 16KB 对齐校验: 原内联 grep 三重脆弱 → 调用 native/check-page-align.sh
+#     (READELF 指定 NDK llvm-readelf; jniLibs 两库 + APK 解包产物双重校验)
+#   * 原生两库编译: 改用 native-builder 交付的 native/build-proot.sh 与
+#     native/build-qemu-user-static.sh (原内联编译缺 talloc/libandroid-shmem 静态链
+#     与 NEEDED=0 断言; 两脚本 BASH_SOURCE 自定位不依赖 cwd, qemu 引用文件路径不变)
+#   * 四大 gate 全部落地; 发布前四件套 assert; fail_on_unmatched_files 双保险
+#   * 签名: Secrets (KEYSTORE_BASE64/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD) 经
+#     base64 -d 还原后以 CI_KEYSTORE_* 环境变量交给 app/build.gradle.kts; 无 Secrets 时
+#     tag 发布硬失败, workflow_dispatch 冒烟回落 debug 签名(见 P5 §3)
+#
+# 版本策略: tag v* 触发正式发布; snapshotVersion = 构建日(UTC)+oc<OC_VERSION>
+#           (build-snapshot.sh 口径); APK versionName = tag 去 v 前缀;
+#           gate ③ 断言 manifest.ocVersion == OC_VERSION, 双向防漂移。
+# =============================================================================
+name: release
+
+on:
+  push:
+    tags: ["v*"]            # 正式发布入口 (P1 §5.5)
+  workflow_dispatch: {}     # 手动触发: device-validator 冒烟入口, 不发 Release
+
+permissions:
+  contents: read            # 最小权限基线; 仅 job_release 发 Release 时提权 (终裁 #4 拆分)
+
+env:
+  OC_VERSION: "1.18.34"     # 与 snapshot/build-snapshot.sh 默认值同一口径, 升级两处同步改
+
+jobs:
+  # ═══════════════════ ① job_snapshot: 快照构建 (arm64 原生 chroot) ═══════════════════
+  job_snapshot:
+    runs-on: ubuntu-24.04-arm          # GitHub 官方 arm64 runner, 免 qemu (P1 §5.1)
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build engine snapshot
+        # 脚本内置: 非 root 自提升 / chroot 预装工具链+opencode / --version 冒烟 /
+        #           脚本侧体积门禁 / manifest C1 自检; 产物 OUT_DIR=dist/
+        run: |
+          chmod +x snapshot/build-snapshot.sh
+          OUT_DIR=dist ./snapshot/build-snapshot.sh "${OC_VERSION}"
+
+      # ── gate ② 快照体积硬门禁: 独立于脚本内门禁的复核 (P1 D3 / P2a §3.1 双保险) ──
+      - name: "Gate 2: snapshot size <= 160MiB"
+        run: |
+          SIZE=$(stat -c%s dist/oc-ubuntu-arm64.tar.gz)
+          MAX=167772160                          # 160MB ≡ 160MiB 口径 (P2a §1.4)
+          echo "snapshot size = ${SIZE} bytes (gate = ${MAX})"
+          if [ "${SIZE}" -gt "${MAX}" ]; then
+            echo "::error::快照超体积门禁 ${SIZE} > ${MAX} 字节。先裁工具链 (P2a §1.3 优先级), 禁止静默放行"
+            exit 1
+          fi
+
+      # ── gate ③ manifest schemaVersion==1 + C1 字段完整性 + sha256/size 一致性 ──
+      - name: "Gate 3: manifest schema & consistency"
+        run: |
+          jq -e '
+            .schemaVersion == 1
+            and (.snapshotVersion | test("^[0-9]{8}-oc"))
+            and .ocVersion == $oc
+            and (.ubuntuBase | length > 0)
+            and .file == "oc-ubuntu-arm64.tar.gz"
+            and (.sha256 | test("^[0-9a-f]{64}$"))
+            and (.size | type == "number" and . > 0)
+            and .format == "tar.gz"
+            and .layout == "rootfs-at-tar-root"
+            and .excludes == ["./workspace", "./root/.local/share/opencode"]
+            and (.minAppVersion | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+          ' --arg oc "${OC_VERSION}" dist/manifest.json > /dev/null \
+            || { echo "::error::manifest.json 未通过 C1 字段完整性断言 (P1 §3.1)"; exit 1; }
+          EXPECTED_SHA=$(jq -r .sha256 dist/manifest.json)
+          ACTUAL_SHA=$(sha256sum dist/oc-ubuntu-arm64.tar.gz | cut -d' ' -f1)
+          [ "${EXPECTED_SHA}" = "${ACTUAL_SHA}" ] \
+            || { echo "::error::sha256 不一致: manifest=${EXPECTED_SHA} actual=${ACTUAL_SHA}"; exit 1; }
+          EXPECTED_SIZE=$(jq -r .size dist/manifest.json)
+          ACTUAL_SIZE=$(stat -c%s dist/oc-ubuntu-arm64.tar.gz)
+          [ "${EXPECTED_SIZE}" = "${ACTUAL_SIZE}" ] \
+            || { echo "::error::size 不一致: manifest=${EXPECTED_SIZE} actual=${ACTUAL_SIZE}"; exit 1; }
+          echo "gate 3 PASS: oc=${OC_VERSION} sha256=${ACTUAL_SHA} size=${ACTUAL_SIZE}"
+
+      - name: Verify snapshot smoke (tar 可读 + opencode 二进制存在)
+        run: |
+          test -f dist/oc-ubuntu-arm64.tar.gz
+          tar -tzf dist/oc-ubuntu-arm64.tar.gz | grep -q './usr/local/bin/opencode'
+          test -f dist/manifest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshot
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ═══════════ ② job_android: 原生两库 NDK 编译 + 双变体签名 APK (发布拆至 job_release, 终裁 #4) ═══════════
+  job_android:
+    needs: job_snapshot
+    runs-on: ubuntu-24.04               # x86_64, NDK 交叉编译 arm64 产物
+    timeout-minutes: 120
+    # permissions 沿用顶层最小基线 contents:read —— Release 发布与 contents:write 已迁至 job_release (终裁 #4)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17", cache: gradle }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Locate NDK (供 native 两脚本与 gate ① 使用)
+        run: |
+          NDK_DIR="$(ls -d "${ANDROID_HOME}/ndk"/* 2>/dev/null | sort -V | tail -n1)"
+          [ -n "${NDK_DIR}" ] || { echo "::error::runner 未预装 Android NDK"; exit 1; }
+          echo "NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "NDK: ${NDK_DIR}"
+
+      - name: Install build deps (qemu meson 构建链)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config ninja-build
+
+      - uses: actions/download-artifact@v4
+        with: { name: snapshot, path: dist/ }
+
+      - name: Derive app version from tag
+        run: |
+          APP_VERSION_NAME="${GITHUB_REF_NAME#v}"
+          if ! [[ "${APP_VERSION_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::非 vX.Y.Z tag (手动触发?), APK 版本号回落 0.0.0-local"
+            APP_VERSION_NAME="0.0.0-local"
+          fi
+          IFS=. read -r VMA VMI VPA <<< "${APP_VERSION_NAME}"
+          # 10# 前缀防前导零被 bash 当八进制 (如 v2.0.08)
+          echo "APP_VERSION_NAME=${APP_VERSION_NAME}"          >> "$GITHUB_ENV"
+          echo "APP_VERSION_CODE=$(( 10#$VMA * 1000000 + 10#$VMI * 1000 + 10#$VPA ))" >> "$GITHUB_ENV"
+
+      # ── [发布阻断·前置] 第三方依赖 SHA256 未补齐 = 不可发布状态 (P2b §7-1) ──
+      - name: "Release blocker: third-party SHA256 must be configured"
+        run: |
+          MISSING="$(grep -E \
+            -e '^ZLIB_SHA256="\$\{ZLIB_SHA256:-\}"$' \
+            -e '^LIBICONV_SHA256="\$\{LIBICONV_SHA256:-\}"$' \
+            -e '^PCRE2_SHA256="\$\{PCRE2_SHA256:-\}"$' \
+            -e '^GLIB_SHA256="\$\{GLIB_SHA256:-\}"$' \
+            native/build-qemu-user-static.sh | cut -d= -f1 || true)"
+          if [ -n "${MISSING}" ]; then
+            echo "::error::发布阻断 (P2b §7-1): 以下第三方依赖 SHA256 仍为空, 处于不可发布状态:"
+            echo "${MISSING}" | sed 's/^/    /'
+            echo "  补齐: 在 native/build-qemu-user-static.sh 填默认值 (核对 zlib.net fossils /"
+            echo "  ftp.gnu.org / PCRE2 GitHub Releases / download.gnome.org), 或改经 CI 环境变量注入并同步调整本 step"
+            exit 1
+          fi
+
+      # ── 原生两库编译 (native-builder 交付脚本, 内含架构/NEEDED=0/对齐自检) ──
+      - name: Build host binaries (proot + qemu-user, 16KB aligned)
+        run: |
+          bash native/build-proot.sh
+          # 引用文件不变: native/build-qemu-user-static.sh (BASH_SOURCE 自定位, 不依赖 cwd;
+          # 等价于骨架期 cwd=native/proot-src + ../build-qemu-user-static.sh 的调用形式)
+          bash native/build-qemu-user-static.sh
+          ls -l app/src/main/jniLibs/arm64-v8a/
+
+      # ── gate ① 16KB 对齐校验: release-ops 侧独立复核 (P1 §7-3, 替换原脆弱 grep) ──
+      - name: "Gate 1: 16KB page alignment (check-page-align.sh)"
+        run: |
+          READELF="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          LIBS=(app/src/main/jniLibs/arm64-v8a/*.so)
+          [ -e "${LIBS[0]}" ] || { echo "::error::jniLibs 无产物, 两库编译未落位"; exit 1; }
+          READELF="${READELF}" bash native/check-page-align.sh "${LIBS[@]}"
+
+      - name: Inject snapshot into full variant assets
+        # 落位与引擎层读取契约一致: SnapshotInstaller assets.open("snapshot/manifest.json")
+        run: |
+          mkdir -p app/src/full/assets/snapshot
+          cp dist/oc-ubuntu-arm64.tar.gz dist/manifest.json app/src/full/assets/snapshot/
+          ls -l app/src/full/assets/snapshot/
+
+      - name: Check gradle wrapper committed
+        run: |
+          test -x ./gradlew || { echo "::error::gradle wrapper 未入仓 (须提交 gradlew + gradle/wrapper/*); 首次接入: gradle wrapper --gradle-version 8.7"; exit 1; }
+
+      # ── 签名 + 双变体出包 (Secrets → base64 -d 还原 → CI_KEYSTORE_* 环境变量) ──
+      - name: Restore keystore & build signed APKs (full/lite)
+        env:
+          KEYSTORE_BASE64:  ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_BASE64}" ]; then
+            KS="${RUNNER_TEMP}/release.keystore"        # 写 runner 临时目录, 不落工作区
+            echo "${KEYSTORE_BASE64}" | base64 -d > "${KS}"
+            export CI_KEYSTORE_FILE="${KS}"
+            export CI_KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD}"
+            export CI_KEY_ALIAS="${KEY_ALIAS}"
+            export CI_KEY_PASSWORD="${KEY_PASSWORD}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::tag 发布缺少签名 Secrets (KEYSTORE_BASE64 等), 拒绝产出不可发布物"; exit 1
+          else
+            echo "::warning::未配置签名 Secrets, 本次按 debug 签名兜底 (仅限 workflow_dispatch 冒烟, 产物不得对外分发)"
+            echo "debug-signed" > "${RUNNER_TEMP}/.debug-signed"
+          fi
+          ./gradlew :app:assembleFullRelease :app:assembleLiteRelease
+
+      # ── gate ④ APK manifest extractNativeLibs="true" 断言 (D4/C3 第 4 项, 双保险) ──
+      - name: "Gate 4: extractNativeLibs=true in APK manifest"
+        run: |
+          AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
+          RC=0
+          for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
+            LINE="$($"$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            echo "${apk}: ${LINE:-<attribute absent>}"
+            echo "${LINE}" | grep -q '"true"' || {
+              echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
+              RC=1; }
+          done
+          exit ${RC}
+
+      # ── gate ① 补充: APK 内打包产物二次对齐校验 (useLegacyPackaging 下 .so 未压缩, 字节等同) ──
+      - name: "Gate 1b: packaged .so alignment recheck (from APK)"
+        run: |
+          READELF="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          TMP="$(mktemp -d)"
+          RC=0
+          for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
+            unzip -q -j "${apk}" 'lib/arm64-v8a/libproot.so' 'lib/arm64-v8a/libqemu_aarch64.so' -d "${TMP}/pkg" \
+              || { echo "::error::APK 内缺 libproot.so/libqemu_aarch64.so: ${apk}"; RC=1; continue; }
+            READELF="${READELF}" bash native/check-page-align.sh "${TMP}"/pkg/*.so || RC=1
+          done
+          rm -rf "${TMP}"; exit ${RC}
+
+      # ── 发布前四件套 assert (full APK / lite APK / tar.gz / manifest.json) ──
+      - name: Assert release bundle (四件套齐备 + 传输后完整性复核)
+        run: |
+          N_FULL=$(ls app/build/outputs/apk/full/release/*.apk | wc -l)
+          N_LITE=$(ls app/build/outputs/apk/lite/release/*.apk | wc -l)
+          [ "${N_FULL}" -eq 1 ] || { echo "::error::full 变体应恰有 1 个 APK, 实得 ${N_FULL}"; exit 1; }
+          [ "${N_LITE}" -eq 1 ] || { echo "::error::lite 变体应恰有 1 个 APK, 实得 ${N_LITE}"; exit 1; }
+          for f in app/build/outputs/apk/full/release/*.apk \
+                   app/build/outputs/apk/lite/release/*.apk \
+                   dist/oc-ubuntu-arm64.tar.gz dist/manifest.json; do
+            [ -s "${f}" ] || { echo "::error::发布产物缺失或为空: ${f}"; exit 1; }
+          done
+          # artifact 跨 job 传输后的完整性复核 (P2a §3.2 三点链路的发布前复核点)
+          EXPECTED_SHA=$(jq -r .sha256 dist/manifest.json)
+          ACTUAL_SHA=$(sha256sum dist/oc-ubuntu-arm64.tar.gz | cut -d' ' -f1)
+          [ "${EXPECTED_SHA}" = "${ACTUAL_SHA}" ] \
+            || { echo "::error::传输后 sha256 失配: manifest=${EXPECTED_SHA} actual=${ACTUAL_SHA}"; exit 1; }
+          # 版本联动断言: manifest.ocVersion 必须与本流水线锁定值一致 (防漂移)
+          jq -e --arg oc "${OC_VERSION}" '.ocVersion == $oc' dist/manifest.json > /dev/null \
+            || { echo "::error::manifest.ocVersion != ${OC_VERSION}, 快照与流水线版本漂移"; exit 1; }
+          if [ -f "${RUNNER_TEMP}/.debug-signed" ]; then
+            echo "::error::产物为 debug 签名, 禁止发布 (仅限 workflow_dispatch 冒烟)"; exit 1
+          fi
+          echo "四件套齐备: $(ls app/build/outputs/apk/full/release/*.apk) / $(ls app/build/outputs/apk/lite/release/*.apk) / dist/oc-ubuntu-arm64.tar.gz / dist/manifest.json"
+
+      # ── 产物交接: 上传双 APK artifact 供 job_smoke_16kb 冒烟与 job_release 发布消费 ──
+      #    口径与既有 snapshot artifact 一致: upload-artifact@v4 + if-no-files-found: error
+      #    (Publish to GitHub Release 已迁至 job_release, 终裁 #4)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: |
+            app/build/outputs/apk/full/release/*.apk
+            app/build/outputs/apk/lite/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  # ═══════════ ③ job_smoke_16kb: 16KB 模拟器冒烟 (C3 第 3 项, P1 §3.3 终裁 #4) ═══════════
+  # P1 §3.3 终裁 #4: 16KB 模拟器冒烟列为 CI 硬性校验 —— 本 job 任一步失败 →
+  # needs 链使 job_release 不执行 → 四件套无法落 Release (硬阻断, 见 ④)。
+  # runner: ubuntu-latest (GitHub hosted x86_64, 自带 KVM 硬件加速)。
+  # 已知边界: full APK 为 arm64-v8a 单 ABI, API 35 16k 镜像为 x86_64 变体; 若 adb install
+  #   报 INSTALL_FAILED_NO_MATCHING_ABIS, 属 ABI 口径问题, 由 device-validator 在 M0
+  #   矩阵裁定 (真机 arm64 为最终验收口径), 本 job 不静默放宽。
+  job_smoke_16kb:
+    needs: [job_android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }   # sdkmanager/avdmanager 依赖 JRE
+
+      - uses: actions/download-artifact@v4
+        with: { name: apks, path: apks/ }   # job_android 产出 (口径同 snapshot: v4 + if-no-files-found: error)
+
+      # ── C3 第 3 项: API 35 16KB page 镜像 (x86_64-16k 变体) headless 启动 + 断言链 ──
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64-16k             # 16KB page size 镜像变体; 非 16k 镜像在 PAGESIZE 断言处拦截
+          emulator-options: >-         # headless 参数 (KVM 加速由 runner 自带 /dev/kvm 提供)
+            -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          script: |
+            # 启动等待: sys.boot_completed == 1 (emulator-runner 内部已有等待, 此为显式复核)
+            adb wait-for-device
+            BOOT=""
+            for i in $(seq 1 60); do
+              BOOT="$(adb shell getprop sys.boot_completed | tr -d '\r')"
+              if [ "${BOOT}" = "1" ]; then break; fi
+              sleep 5
+            done
+            if [ "${BOOT}" != "1" ]; then
+              echo "::error::模拟器 300s 内未完成启动 (sys.boot_completed != 1)"; exit 1
+            fi
+
+            # 断言 1: 内核页大小必须 16384 (镜像装错在此拦截, P1 §3.3)
+            PAGESIZE="$(adb shell getconf PAGESIZE | tr -d '\r')"
+            echo "PAGESIZE = ${PAGESIZE}"
+            if [ "${PAGESIZE}" != "16384" ]; then
+              echo "::error::PAGESIZE=${PAGESIZE} != 16384, 非 16KB page 镜像 (C3 第 3 项)"; exit 1
+            fi
+
+            # 断言 2: 安装 full APK (job_android 产出 artifact, 路径口径 = 上传 apks/full/release/*.apk)
+            APK="$(ls apks/full/release/*.apk)"
+            adb install -r "${APK}" \
+              || { echo "::error::full APK 安装失败: ${APK} (NO_MATCHING_ABIS 见 job 头注释已知边界)"; exit 1; }
+
+            # 断言 3: jniLibs 内 libproot.so 在设备上直接执行 --version, 退出码 0
+            #   (P2b §3.3; 同时验证 D4 解包落位 /data/app/*/lib/arm64/ + 16KB 内核可加载 ELF
+            #    + proot 静态产物 NEEDED=0 运行时自足)
+            PROOT_LIB="$(adb shell "ls /data/app/*/lib/arm64/libproot.so 2>/dev/null" | tr -d '\r' | head -n1)"
+            if [ -z "${PROOT_LIB}" ]; then
+              echo "::error::设备上未找到解包后的 libproot.so (D4 落位异常?)"; exit 1
+            fi
+            echo "libproot = ${PROOT_LIB}"
+            adb shell "${PROOT_LIB} --version" \
+              || { echo "::error::libproot.so --version FAIL (16KB 内核加载/运行时自足不通过)"; exit 1; }
+
+      # TODO(device-validator): M0-3 qemu 模式项 (guest 内 opencode --version) 待其交付
+      #   native/ci-smoke-16kb.sh (脚本已在交付计划内) 后挂入本 job —— 挂入方式: 用
+      #   `script: bash native/ci-smoke-16kb.sh` 整体替换 emulator-runner 的上述内联
+      #   script (其余 with 参数不变; 脚本自含 PAGESIZE/boot/APK 断言链即可)。
+
+  # ═══════════ ④ job_release: GitHub Release 发布 (needs 链硬阻断, P1 §3.3) ═══════════
+  # needs: [job_android, job_smoke_16kb] —— 任一前置 job 失败 → 本 job 不执行 →
+  # 四件套 (full APK / lite APK / tar.gz / manifest.json) 无法落 Release, 硬阻断生效。
+  # 原 job_android 内 Publish 步骤整体迁移至此 (终裁 #4), files 集合与双保险不变。
+  job_release:
+    needs: [job_android, job_smoke_16kb]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write                   # softprops/action-gh-release 创建 Release 所需 (自 job_android 迁移)
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: snapshot, path: dist/ }
+      - uses: actions/download-artifact@v4
+        with: { name: apks, path: apks/ }
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apks/full/release/*.apk
+            apks/lite/release/*.apk
+            dist/oc-ubuntu-arm64.tar.gz
+            dist/manifest.json
+          fail_on_unmatched_files: true   # 任一 glob 未命中即 fail (与四件套 assert 双保险)
+          generate_release_notes: true
