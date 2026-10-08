@@ -215,6 +215,62 @@ if [[ -n "$PROOT_COMMIT" ]]; then
     git -C "$PROOT_DIR" checkout --detach "$PROOT_COMMIT"
   fi
 fi
+
+# ── CI run#10 根因修复：隐式声明防御补丁（NDK r29 / clang 19 硬错误）─────────
+# 实锤（CI run#10）：src/extension/ashmem_memfd/ashmem_memfd.c 调用 strcmp/
+#   memset 但未 #include <string.h>（其 include 表仅 stdlib/signal/unistd/
+#   sys/syscall/linux/ashmem/linux/memfd/talloc 与项目内头），靠 C89 时代的
+#   隐式函数声明。NDK r29（clang 19，runner 实测 29.0.14206865；clang 16 起
+#   已把 C99+ 模式下的 -Wimplicit-function-declaration 从警告升级为默认硬
+#   错误）直接编译失败：
+#     error: call to undeclared library function 'strcmp' ...
+#            [-Wimplicit-function-declaration]
+#   属 proot 老源码 × 新工具链问题，与构建配方无关。明确不采用全局
+#   -Wno-error=implicit-function-declaration 降级：会掩盖真问题，且 64 位
+#   ABI 上隐式声明假定 int 返回值、返回指针的函数被截断属实险——宁可
+#   include 补齐。
+# 方案：编译前源码自愈。grep -E（≡egrep）扫描 proot-src 全部 .c（含 src/
+#   及其 extension/ 等子目录；CI 日志里的 ./extension/... 即相对 src/），
+#   凡用到下列函数但文件内缺对应 #include 的，在第 1 行前插入（合法 C，
+#   位于最顶注释之前亦可）：
+#     * string.h 族：strcmp/strncmp/strcpy/strncpy/strcat/strncat/strlen/
+#       strnlen/strchr/strrchr/strstr/strdup/strndup/strspn/strcspn/strpbrk/
+#       strtok/strtok_r/strerror/strerror_r/strcasecmp/strncasecmp/strsignal/
+#       memset/memcpy/memmove/memcmp/memchr/memmem
+#     * stdio.h 族：snprintf/sprintf/sscanf/vsnprintf/fprintf/printf/puts/
+#       fputs —— 注意 snprintf 声明在 stdio.h 而非 string.h，必须分族判定
+#       补齐，否则"只插 string.h"的防御对 snprintf 类缺失根本无效。
+#   插第 1 行安全性（已核验上游 src/GNUmakefile）：-D_GNU_SOURCE 经
+#   CPPFLAGS 放在编译命令行、先于一切头文件解析，include 顺序不影响特性宏
+#   展开；loader/loader.c 为 -ffreestanding 的 NO_LIBC_HEADER 独立代码，
+#   不调用任何标准库字符串/内存函数（自带 clear/basename），扫描不会命中、
+#   freestanding 语义零干扰。
+# 幂等：已显式包含对应头文件的文件自动跳过，KEEP_BUILD=1 重跑不重复插入。
+# sed 用 POSIX 标准 'i\' + 换行形式（GNU/BSD 通用），-i.bak 后删备份以兼容
+# macOS sed 的 -i 必须带后缀。若 CI 再现其他头文件族（stdlib.h/errno.h 等）
+# 同类错误，按同模式扩展即可。
+log "隐式声明防御补丁（clang 19 硬错误 → 编译前源码补齐 include）"
+_PATCH_COUNT=0
+while IFS= read -r -d '' f; do
+  if grep -Eq '(^|[^A-Za-z0-9_])(strcmp|strncmp|strcpy|strncpy|strcat|strncat|strlen|strnlen|strchr|strrchr|strstr|strdup|strndup|strspn|strcspn|strpbrk|strtok|strtok_r|strerror|strerror_r|strcasecmp|strncasecmp|strsignal|memset|memcpy|memmove|memcmp|memchr|memmem)[[:space:]]*\(' "$f" \
+     && ! grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"]string\.h[>"]' "$f"; then
+    sed -i.bak '1i\
+#include <string.h>' "$f" || die "隐式声明补丁失败: $f"
+    rm -f "$f.bak"
+    log "  [patch] + #include <string.h> ← ${f#"$PROOT_DIR"/}"
+    _PATCH_COUNT=$((_PATCH_COUNT + 1))
+  fi
+  if grep -Eq '(^|[^A-Za-z0-9_])(snprintf|sprintf|sscanf|vsnprintf|fprintf|printf|puts|fputs)[[:space:]]*\(' "$f" \
+     && ! grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"]stdio\.h[>"]' "$f"; then
+    sed -i.bak '1i\
+#include <stdio.h>' "$f" || die "隐式声明补丁失败: $f"
+    rm -f "$f.bak"
+    log "  [patch] + #include <stdio.h> ← ${f#"$PROOT_DIR"/}"
+    _PATCH_COUNT=$((_PATCH_COUNT + 1))
+  fi
+done < <(find "$PROOT_DIR" -type f -name '*.c' -print0)
+log "  [patch] 完成：共插入 $_PATCH_COUNT 处 include"
+
 (
   cd "$PROOT_DIR"
   # 参数与 termux-packages packages/proot/build.sh 对齐：
