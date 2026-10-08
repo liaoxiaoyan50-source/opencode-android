@@ -23,7 +23,10 @@
 # 说明：
 #   * Termux 官方 proot 为动态链 libtalloc.so；NDK sysroot 不含 talloc/shmem，
 #     故本脚本将其二者静态编译为 .a 后一并链入，实现 C3 的"静态优先"，
-#     并在编译后断言产物 NEEDED 为零（满足"如动态链需 CI 断言零额外依赖"的等效项）。
+#     并在编译后以 NEEDED 白名单断言（C3-N）确保零【自建库】动态依赖。
+#     【ADR-C3-R2 修订】liblog/libandroid 平台库 NDK 仅提供 .so（无 .a），
+#     且 lld 拒绝 -static 链接动态对象，全静态物理不可行 → 改为「半静态」：
+#     自建库全静态吸入，仅允许系统库动态 NEEDED。详见 step 4 (b) 断言处。
 #   * 不设 PROOT_UNBUNDLE_LOADER（Termux 用于分离 loader 的优化）：保持 loader
 #     内嵌、运行期提取到 PROOT_TMP_DIR（engine-layer 契约已定 = app cache 目录）。
 #
@@ -84,6 +87,22 @@ RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
 STRIP="$TOOLCHAIN/bin/llvm-strip"
 READELF="$TOOLCHAIN/bin/llvm-readelf"
 [[ -x "$CC" ]] || die "NDK 编译器不存在: $CC"
+
+# ── sysroot 平台库搜索路径（CI run#18 根因修复）──────────────────────────────
+# run#18 报 `ld.lld: error: unable to find library -llog`（-landroid 同）：
+# 原 LDFLAGS 只挂了 -L$STAGING/lib（自建库），从未把 NDK sysroot 库目录纳入
+# 搜索路径。liblog/libandroid 是平台库，clang driver 在非 -static 下虽通常
+# 自动带入，但显式 -L 更稳妥、且 r29 与 r30 的目录布局不同：
+#   * NDK r29: sysroot/usr/lib/<abi>/<api>/   （带 API 子目录）
+#   * NDK r30: sysroot/usr/lib/<abi>/         （扁平化，实测 runner 已升 r30）
+# 两候选都挂 → 双版本通吃（目录不存在则跳过，不报错）。
+NDK_SYSROOT_LIBDIR="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android"
+SYSROOT_LDFLAGS=""
+for _d in "$NDK_SYSROOT_LIBDIR/${API_LEVEL}" "$NDK_SYSROOT_LIBDIR"; do
+  [[ -d "$_d" ]] && SYSROOT_LDFLAGS="$SYSROOT_LDFLAGS -L$_d"
+# done
+[[ -n "$SYSROOT_LDFLAGS" ]] || die "未定位到 NDK sysroot 库目录: $NDK_SYSROOT_LIBDIR"
+log "sysroot -L:$SYSROOT_LDFLAGS"
 
 log "NDK: $NDK_ROOT"
 log "CC : $CC"
@@ -336,7 +355,7 @@ log "  [patch] 完成：共插入 $_PATCH_COUNT 处 include"
   #   -C src ............................ termux/proot 构建入口为 src/GNUmakefile
   #   PROOT_WITH_LIBANDROID_SHMEM=true .. 启用 ashmem shm 分支（引用 step1 产物）
   #   -DARG_MAX / -DVERSION ............. termux 配方原样 CPPFLAGS
-  #   -static ........................... C3 静态优先（bionic libc 静态入包）
+  #   半静态（ADR-C3-R2）................ 自建库 -static 吸入，系统库动态 NEEDED
   #   ALIGN_LDFLAG ...................... D7：16KB host page LOAD 段对齐
   #
   # ── CI run#5 根因修复（step#11 链接期 undefined reference）──────────────────
@@ -349,21 +368,26 @@ log "  [patch] 完成：共插入 $_PATCH_COUNT 处 include"
   # → -ltalloc / -landroid-shmem 根本进不了链接行 → undefined reference。
   # 改为环境变量后（优先级低于 makefile 赋值），+= 正常追加，与 termux 官方
   # 构建一致。已用 pinned GNUmakefile + make -n 干跑验证最终装配：
-  #   proot 链接 = <objs> -static -Wl,-z,max-page-size=16384 -L<staging>/lib
-  #                -llog -landroid -ltalloc -Wl,-z,noexecstack -landroid-shmem
+  #   proot 链接 = <objs> -Wl,-z,max-page-size=16384 -L<staging>/lib
+  #                -L<sysroot> -llog -landroid -ltalloc -Wl,-z,noexecstack
+  #                -landroid-shmem
   #
-  # -llog / -landroid = 静态链 libandroid-shmem v0.7 的硬依赖（源码实测）：
+  # -llog / -landroid = 链 libandroid-shmem v0.7 的硬依赖（源码实测）：
   #   shmem.c 无条件 #include <android/log.h>，DBG(...)=__android_log_print；
   #   android26（API>=26）分支改走 ASharedMemory_create/getSize（属 libandroid）。
-  #   NDK sysroot 自带 liblog.a / libandroid.a，按需抽成员、不产生 NEEDED，
-  #   step4 的零依赖断言仍成立。二者置于 GNUmakefile 追加的 -landroid-shmem
-  #   之前即可：NDK r19+ 固定用 lld，lld 对静态库惰性解析、与顺序无关
-  #   （本机实测：GNU ld 同序报 undefined reference，lld 同序链接通过）。
+  #   【ADR-C3-R2 纠正】早期注释断言"NDK sysroot 自带 liblog.a / libandroid.a，
+  #   按需抽成员、不产生 NEEDED"——**该论断经 NDK r29 实测为假**：
+  #   find $NDK -name liblog.a / libandroid.a 均零结果，sysroot 下仅有
+  #   liblog.so(12KB)/libandroid.so(48KB)（位于 <abi>/<api>/ 内）。故二者必然
+  #   产生动态 NEEDED，C3 已由"全静态"修订为"半静态"（系统库动态许可），
+  #   断言改为 C3-N 白名单（见 step4 (b)）。二者置于 GNUmakefile 追加的
+  #   -landroid-shmem 之前即可：lld 惰性解析、顺序无关（本机实测：
+  #   GNU ld 同序报 undefined reference，lld 同序链接通过）。
   #
   # 其他兼容点（均已核验，无需改动）：
   #   * loader 用独立 LOADER_LDFLAGS（-static -nostdlib -Wl,-Ttext=...）链接，
   #     不消费 $(LDFLAGS) → env 传法不污染 freestanding loader（干跑已验证）；
-  #   * OBJIFY / loader.exe 的工具变量（CI run#15-17 根因修复）──────────────
+  #   * loader.exe 的工具变量（CI run#15-17 根因修复）──────────────
   #     GNUmakefile 的 STRIP ?= $(CROSS_COMPILE)strip，未显式传入时取【宿主
   #     x86_64 strip】——L240 规则 `$(STRIP) $@` 处理 arm64 的 loader.exe 时
   #     直接报错：strip: Unable to recognise the format of the input file
@@ -381,7 +405,7 @@ log "  [patch] 完成：共插入 $_PATCH_COUNT 处 include"
   OBJDUMP="$TOOLCHAIN/bin/llvm-objdump" \
   CPPFLAGS="-DARG_MAX=131072 -DVERSION=\"${PROOT_REF#v}\" -I$STAGING/include" \
   CFLAGS="-O2" \
-  LDFLAGS="-static $ALIGN_LDFLAG -L$STAGING/lib -llog -landroid" \
+  LDFLAGS="$ALIGN_LDFLAG -L$STAGING/lib $SYSROOT_LDFLAGS -llog -landroid" \
   make -C src -j"$JOBS" PROOT_WITH_LIBANDROID_SHMEM=true
   "$STRIP" src/proot
 )
@@ -395,12 +419,30 @@ PROOT_BIN="$PROOT_DIR/src/proot"
 "$READELF" -h "$PROOT_BIN" | grep -q 'Machine:.*AArch64' \
   || die "架构断言失败：产物不是 AArch64"
 
-# (b) C3 静态断言：NEEDED 必须为 0（零额外 .so 依赖）
-NEEDED="$("$READELF" -d "$PROOT_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
-if [[ -n "$NEEDED" ]]; then
-  die "静态断言失败：产物存在动态 .so 依赖（违反 C3）：
-$NEEDED"
+# (b) C3-N 半静态断言：NEEDED 仅允许 Android 系统库；任何自建库(.so)出现即失败
+#   【ADR-C3-R2 修订】原契约要求 NEEDED=0（全静态），但 NDK r29 实测：
+#     * find $NDK -name liblog.a / libandroid.a → 零结果（NDK 从未提供二者的
+#       静态库，只随 sysroot 提供 .so），而 lld 拒绝 `-static` 链接动态对象
+#       （attempted static link of dynamic object .../liblog.so）；
+#     * llvm-ar 无法从 .so 抽成员重建 .a（file too small to be an archive）。
+#     → 全静态对本两库物理不可行，无任何 tunable 可绕过（架构总师终裁）。
+#   修订为「半静态」：自建依赖（libtalloc/libandroid-shmem/proot 自身 .o）
+#   必须静态吸入（.a）；仅允许 liblog/libandroid/libc/libdl/libm 等
+#   /system/lib64 内建稳定 ABI 的系统库产生动态 NEEDED。
+#   断言方向随之反转：从「NEEDED 必须为空」改为「NEEDED 每项必须命中白名单」——
+#   这才是安全核心：libtalloc.so 等自建库一旦出现在 NEEDED 即被拒绝
+#   （它们不在白名单，且运行期会真实加载失败）。
+ALLOWED_RE='^(liblog\.so|libandroid\.so|libc\.so|libdl\.so|libm\.so|libstdc\+\+\.so|libc\+\+_shared\.so)$'
+NEEDED_LIST="$("$READELF" -d "$PROOT_BIN" 2>/dev/null | awk '/NEEDED/{gsub(/[\[\]]/,"",$NF);print $NF}' || true)"
+BAD=""
+while IFS= read -r _n; do
+  [[ -z "$_n" ]] && continue
+  printf '%s' "$_n" | grep -qE "$ALLOWED_RE" || BAD="$BAD $_n"
+done <<< "$NEEDED_LIST"
+if [[ -n "$BAD" ]]; then
+  die "半静态断言失败：出现非系统库动态依赖（违反 C3-N）：$BAD"
 fi
+log "半静态断言通过：NEEDED 全为系统库：$(printf '%s' "$NEEDED_LIST" | tr '\n' ' ')"
 
 # (c) D7 对齐断言：复用 check-page-align.sh 精确解析 LOAD 段 Align 字段
 if [[ -x "$SCRIPT_DIR/check-page-align.sh" ]]; then
@@ -416,5 +458,5 @@ KEEP_BUILD="${KEEP_BUILD:-0}"
 [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD_DIR"
 
 log "完成 → $JNILIBS_DIR/libproot.so"
-log "  架构: AArch64 / 静态链接 / NEEDED=0 / LOAD 段 Align >= 0x4000"
+log "  架构: AArch64 / 半静态(自建库静态,系统库动态) / LOAD 段 Align >= 0x4000"
 log "  版本: $PROOT_REF ($PROOT_COMMIT) · talloc $TALLOC_VERSION · libandroid-shmem $SHMEM_VERSION"
