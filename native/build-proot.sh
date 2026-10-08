@@ -363,11 +363,22 @@ log "  [patch] 完成：共插入 $_PATCH_COUNT 处 include"
   # 其他兼容点（均已核验，无需改动）：
   #   * loader 用独立 LOADER_LDFLAGS（-static -nostdlib -Wl,-Ttext=...）链接，
   #     不消费 $(LDFLAGS) → env 传法不污染 freestanding loader（干跑已验证）；
-  #   * OBJIFY 走 host objcopy/objdump（GNUmakefile ?= 默认），run#5 能到主
-  #     链接说明二者已成功产出 loader-wrapped.o，无需干预；
+  #   * OBJIFY / loader.exe 的工具变量（CI run#15-17 根因修复）──────────────
+  #     GNUmakefile 的 STRIP ?= $(CROSS_COMPILE)strip，未显式传入时取【宿主
+  #     x86_64 strip】——L240 规则 `$(STRIP) $@` 处理 arm64 的 loader.exe 时
+  #     直接报错：strip: Unable to recognise the format of the input file
+  #     `loader.exe' → make Error 1。OBJCOPY/OBJDUMP 同理（OBJIFY 链）。
+  #     修复：把 NDK 三件套以环境变量传入（llvm-strip/llvm-objcopy/llvm-objdump
+  #     均为 multi-target、能正确处理 aarch64 目标）。
+  #     【教训】早期注释曾断言"OBJIFY 走 host 默认即可、无需干预"——那是基于
+  #     run#5 能走到主链接的假象（当时从未跑到 loader.exe 规则），属误判，勿再
+  #     依赖该结论。CI run#15/#16/#17 三轮全挂于此。
   #   * build.h 的 git describe --tags --dirty --abbrev=8 --always 在 --depth 1
   #     下由 --always 兜底（tag 在手则描述为 v5.1.107.96），无需干预。
   CC="$CC" \
+  STRIP="$STRIP" \
+  OBJCOPY="$TOOLCHAIN/bin/llvm-objcopy" \
+  OBJDUMP="$TOOLCHAIN/bin/llvm-objdump" \
   CPPFLAGS="-DARG_MAX=131072 -DVERSION=\"${PROOT_REF#v}\" -I$STAGING/include" \
   CFLAGS="-O2" \
   LDFLAGS="-static $ALIGN_LDFLAG -L$STAGING/lib -llog -landroid" \
@@ -385,7 +396,7 @@ PROOT_BIN="$PROOT_DIR/src/proot"
   || die "架构断言失败：产物不是 AArch64"
 
 # (b) C3 静态断言：NEEDED 必须为 0（零额外 .so 依赖）
-NEEDED="$('$READELF' -d '$PROOT_BIN' 2>/dev/null | awk '/NEEDED/{print}' || true)"
+NEEDED="$("$READELF" -d "$PROOT_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3）：
 $NEEDED"

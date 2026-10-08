@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- =============================================================================
+     app/src/main/AndroidManifest.xml — OpenCode Android [P5 release-ops]
+     契约落点（对照 P1/P3/P4）：
+       * INTERNET ................ 引擎 HTTP 客户端（http://127.0.0.1:{port}）+ 快照下载
+       * FOREGROUND_SERVICE ...... P1 D8 保活：引擎前台服务
+       * FOREGROUND_SERVICE_DATA_SYNC  API 34+ 前台服务类型必填，与 EngineService
+                                   startForeground(..., FOREGROUND_SERVICE_TYPE_DATA_SYNC) 对应
+       * WAKE_LOCK ............... P1 D8 PARTIAL_WAKE_LOCK（上限 6h 可配）
+       * POST_NOTIFICATIONS ...... API 33+ 前台服务通知需运行时授权
+       * usesCleartextTraffic=true  引擎走 http://127.0.0.1（明文回环），无 TLS 证书
+       * allowBackup=false ....... 引擎二进制/凭据不可云备份（安全）
+     extractNativeLibs 由 app/build.gradle.kts packaging.jniLibs.useLegacyPackaging=true
+     生成（D4 发布阻断级），release.yml "Gate 4" 对最终 APK 断言，勿在此硬编码。
+     ============================================================================= -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:label="OpenCode"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:extractNativeLibs="true"
+        tools:targetApi="35">
+
+        <activity
+            android:name="dev.opencode.mobile.ui.MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="dev.opencode.mobile.engine.EngineService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>
