@@ -532,6 +532,15 @@ for _h in "$_BIONIC_SIGNAL_H" "$TOOLCHAIN/sysroot/usr/include/bits/signal_types.
 done
 [[ "$_BIONIC_HAS_SIGORSET" == 0 ]] \
   || die "bionic 已自带 sigorset（NDK 已更新）：shim 会重复定义，请复核 NDK 版本与 qemu 适配"
+# (a2) 前置断言扩展（run#41）：bionic 亦无 vhangup 函数声明 —— 本 shim 同库提供
+#   static 定义；若未来 NDK 加入 vhangup 声明，shim 的 static 定义将与 extern
+#   声明冲突（编译/链接期冲突）。只查声明形态（vhangup 后跟空白+'('）——
+#   __NR_vhangup / SYS_vhangup 等 syscall 号宏不含括号，不会误命中。
+_BIONIC_UNISTD_H="$TOOLCHAIN/sysroot/usr/include/unistd.h"
+[[ -f "$_BIONIC_UNISTD_H" ]] || die "未找到 bionic unistd.h: $_BIONIC_UNISTD_H"
+if awk '/vhangup[[:space:]]*\(/ { print; f=1 } END { exit !f }' "$_BIONIC_UNISTD_H"; then
+  die "bionic unistd.h 已含 vhangup 声明（上方为命中行原文）：shim 的 static vhangup 将与 extern 声明冲突，请复核 NDK 版本"
+fi
 
 # (b) 前置断言：qemu 侧确有 sigorset 调用（防 qemu 版本漂移后 shim 变成空转）
 awk '/sigorset[[:space:]]*\(/{f=1} END{exit !f}' "$QEMU_DIR/linux-user/signal.c" \
@@ -557,6 +566,17 @@ cat > "$SHIM_HEADER" <<'SHIM_EOF'
  *     本地四向验证：.S 静默通过 / .c shim 生效 / 端到端实跑 sigorset ok /
  *     非 Android target 正确 #error。
  *
+ * 【run#41 扩展 · 同库追加 vhangup】
+ *   现象：run#41 推进到 [373/374]，linux-user/syscall.c:11022:26: error: call to
+ *     undeclared function 'vhangup'（qemu syscall.c:11008
+ *     case TARGET_NR_vhangup 内 `return get_errno(vhangup());`）。
+ *   根因：bionic 全 sysroot 无 vhangup 函数声明/实现（grep 仅命中
+ *     asm-generic/unistd.h:85 __NR_vhangup=58 与 bits/glibc-syscalls.h:1395
+ *     SYS_vhangup —— 均为 syscall 号宏，非函数声明）。glibc 的 vhangup 实现
+ *     即裸 syscall，语义一致 → static 内联封装补齐。
+ *   修法：sigorset 同一 __BIONIC__ 门控块内追加 vhangup（syscall(__NR_vhangup)），
+ *     -include 注入路径完全复用（含 __ASSEMBLER__ 守卫），零新增 CI flag。
+ *
  * 门控说明：NDK clang 只定义 __ANDROID__，不定义 __BIONIC__；
  *   __BIONIC__ 由 sysroot sys/cdefs.h 经 <signal.h> 传递。
  *   故本头必须自行 #include <signal.h>，否则 __BIONIC__ 不可见、门控恒假。
@@ -568,6 +588,8 @@ cat > "$SHIM_HEADER" <<'SHIM_EOF'
 #endif
 #include <signal.h>     /* 关键：引入 sigset_t / NSIG / __BIONIC__ 定义 */
 #include <errno.h>
+#include <unistd.h>      /* run#41: syscall() 原型（vhangup 实现需要） */
+#include <sys/syscall.h> /* run#41: __NR_vhangup（经 asm/unistd.h → asm-generic/unistd.h） */
 
 /* 语义对齐 glibc：*set = *left | *right；成功返回 0，失败返回 -1 且 errno=EINVAL。
  * bionic 无 sigorset，且 sigset_t 是不透明结构体（不可按位或），只能遍历信号号。 */
@@ -583,6 +605,16 @@ static __inline__ int sigorset(sigset_t *set, const sigset_t *left, const sigset
         }
     }
     return 0;
+}
+#  endif
+
+/* vhangup：bionic 无 libc 声明/实现，仅内核 syscall（__NR_vhangup=58）。
+ * qemu syscall.c:11008 `return get_errno(vhangup());`（run#41 实锤
+ * implicit-function-declaration）。glibc 实现即裸 syscall，语义一致。 */
+#  ifndef vhangup
+static __inline__ int vhangup(void)
+{
+    return (int)syscall(__NR_vhangup);
 }
 #  endif
 #endif
@@ -642,6 +674,11 @@ log "  [shim] 已生成 $SHIM_HEADER（$(wc -c < "$SHIM_HEADER") 字节）"
 #       —— **纯原生 syscall，不需要 libc 实现**。故仅 (b)(c) 需要 mq_* libc 符号。
 #   证据5 (b) 块实际调用 libc mq_* 的**只有 2 个**：mq_open(13034) / mq_unlink(13044)。
 #       （mq_getsetattr/mq_notify 未在此块调用；mq_close 亦未调用。）
+#       【run#41 修正】调用面还含 mq_setattr/mq_getattr —— 落在 (c) 块的
+#       case TARGET_NR_mq_getsetattr 分支（syscall.c:13169/13172），是 POSIX
+#       标准名（对齐 glibc mqueue.h:46 mq_getattr / :51 mq_setattr），非内核
+#       内部名 mq_getsetattr。3.7b/3.7c 已同步：shim 头改声明 POSIX 名，
+#       mq-shim.c 补 mq_setattr/mq_getattr 实现（内核 __NR_mq_getsetattr=185）。
 #
 #   方案抉择：**B1（自备 mqueue.h shim + 实现 mq_open/mq_unlink）**。B2 已被**实测证伪**：
 #   ✗ B2（-D__NR_mq_open=0）**不可行** —— 本地实测 `clang -D__NR_mq_open=0 -dM -E` 显示
@@ -727,7 +764,14 @@ cat > "$MQ_SHIM_DIR/mqueue.h" <<'MQSHIM_EOF'
  *
  * 【存在性证据】bionic 无顶层 <mqueue.h>；bionic libc 不导出任何 mq_* 符号
  *   （llvm-nm -D 对 mq_* 零命中）；仅内核 UAPI <linux/mqueue.h> 提供 struct mq_attr。
- *   故本 shim 提供：struct mq_attr（转引 UAPI）+ mqd_t + 7 个 POSIX 原型声明。
+ *   故本 shim 提供：struct mq_attr（转引 UAPI）+ mqd_t + 8 个 POSIX 原型声明。
+ *
+ * 【run#41 修正 · 原型名】初版误声明内核内部名 mq_getsetattr（qemu 从不调用）。
+ *   run#41 实锤 qemu 实际调用的是 POSIX 标准名 mq_setattr/mq_getattr
+ *   （syscall.c:13169/13172，case TARGET_NR_mq_getsetattr 分支；对齐 glibc
+ *   mqueue.h:46 mq_getattr / :51 mq_setattr），已替换，原型计数 7 → 8。
+ *   内核侧仍走 mq_getsetattr(mqd,new,old) 语义：new 非 NULL → 设置并回写
+ *   旧值到 old；new 为 NULL → 仅读旧属性到 old（__NR_mq_getsetattr=185）。
  *
  * 【__ASSEMBLER__ 守卫】双保险：本头经 -I 注入（.S 不 include <mqueue.h>，天然免疫），
  *   但保留守卫以防未来改用 -include（run#37 的 .S 教训，见 step 3.6）。
@@ -762,8 +806,9 @@ extern int mq_timedsend(mqd_t __mqdes, const char *__msg_ptr,
 extern ssize_t mq_timedreceive(mqd_t __mqdes, char *__msg_ptr,
                                size_t __msg_len, unsigned int *__msg_prio,
                                const struct timespec *__abs_timeout);
-extern int mq_getsetattr(mqd_t __mqdes, const struct mq_attr *__newattr,
-                         struct mq_attr *__oldattr);
+extern int mq_getattr(mqd_t __mqdes, struct mq_attr *__mqstat);
+extern int mq_setattr(mqd_t __mqdes, const struct mq_attr *__newattr,
+                      struct mq_attr *__oldattr);
 extern int mq_notify(mqd_t __mqdes, const struct sigevent *__notification);
 
 __END_DECLS
@@ -779,7 +824,9 @@ MQ_SHIM_SRC="$STAGING/mq-shim.c"
 MQ_SHIM_LIB="$STAGING/lib/libqemu-mqshim.a"
 cat > "$MQ_SHIM_SRC" <<'MQIMPL_EOF'
 /* mq-shim.c — bionic 缺失的 mq_* libc 层最小实现（仅供 qemu linux-user 使用）
- * qemu 实际调用面（syscall.c 实测）：仅 mq_open / mq_unlink；
+ * qemu 实际调用面（syscall.c 实测）：mq_open / mq_unlink / mq_setattr / mq_getattr
+ *   【run#41 修正】调用面新增 mq_setattr/mq_getattr（syscall.c:13169/13172，
+ *   case TARGET_NR_mq_getsetattr 分支内），已补实现（内核 __NR_mq_getsetattr=185）；
  * mq_timedsend/mq_timedreceive 走 qemu 原生 safe_syscall（不经 libc）→ 无需实现。
  * mq_close 兜底提供（= close(fd)）。 */
 #include <stdarg.h>
@@ -821,6 +868,19 @@ int mq_close(mqd_t mqdes)
 {
     return (int)syscall(__NR_close, (int)mqdes);
 }
+
+/* mq_setattr/mq_getattr：POSIX 标准名（run#41 实锤 qemu 调用面）。
+ * 内核内部名 mq_getsetattr(mqd, new, old)：new 非 NULL → 设置并回写旧值到 old；
+ * new 为 NULL → 仅读旧属性到 old。__NR_mq_getsetattr=185。 */
+int mq_setattr(mqd_t mqdes, const struct mq_attr *newattr, struct mq_attr *oldattr)
+{
+    return (int)syscall(__NR_mq_getsetattr, mqdes, newattr, oldattr);
+}
+
+int mq_getattr(mqd_t mqdes, struct mq_attr *attr)
+{
+    return (int)syscall(__NR_mq_getsetattr, mqdes, (void *)0, attr);
+}
 MQIMPL_EOF
 [[ -s "$MQ_SHIM_SRC" ]] || die "mq-shim.c 生成失败: $MQ_SHIM_SRC"
 
@@ -834,10 +894,10 @@ mkdir -p "$STAGING/lib"
   || die "mq-shim.c 编译失败（检查 __NR_mq_open/__NR_mq_unlink 是否在 host unistd.h）"
 "$AR" rcs "$MQ_SHIM_LIB" "$STAGING/lib/mq-shim.o" \
   || die "mq-shim 归档失败: $MQ_SHIM_LIB"
-# 正向断言：库内确有 mq_open/mq_unlink 符号（防静默空库）
-"$NM" "$MQ_SHIM_LIB" 2>/dev/null | awk '/ T mq_open$/{o=1} / T mq_unlink$/{u=1} END{exit !(o&&u)}' \
-  || die "libqemu-mqshim.a 内未见 mq_open/mq_unlink 符号（编译/归档静默失败）"
-log "  [impl] 已生成 $MQ_SHIM_LIB（含 mq_open/mq_unlink/mq_close）"
+# 正向断言：库内确有 mq_open/mq_unlink/mq_setattr 符号（防静默空库；run#41 起加验 mq_setattr）
+"$NM" "$MQ_SHIM_LIB" 2>/dev/null | awk '/ T mq_open$/{o=1} / T mq_unlink$/{u=1} / T mq_setattr$/{s=1} END{exit !(o&&u&&s)}' \
+  || die "libqemu-mqshim.a 内未见 mq_open/mq_unlink/mq_setattr 符号（编译/归档静默失败）"
+log "  [impl] 已生成 $MQ_SHIM_LIB（含 mq_open/mq_unlink/mq_close/mq_setattr/mq_getattr）"
 
 # ══════════════════ 第 3.8 步：bionic semun / msqid64_ds / host_termios 三补丁（run#39）═══
 # 【run#39 根因修复】run#39 推进到 [366/374] Compiling ... linux-user_syscall.c.o，
@@ -1010,6 +1070,15 @@ awk '
   }
 ' "$SC" || die "header 顺序断言失败（termios 宏须早于 linux/termios.h，否则 host_termios 仍 incomplete）"
 log "step 3.8/5 完成（semun 门控 + msqid64_ds 条件编译 + sys/mount.h 移位，三补丁全绿）"
+
+# ══════════════════ run#41 结论记录（step 3.8 CI 验证 + 本轮处置） ═════════════
+# step 3.8 三补丁 CI 验证全绿：编译进度 369/374 → 373/374（semun 门控 /
+#   msqid64_ds.__msg_cbytes 条件编译 / sys/mount.h 移位三处错误零复发）。
+# 新阻断点 3 个（syscall.c，全部 undeclared function，bionic 无 libc 声明）：
+#   vhangup(11022) / mq_setattr(13169) / mq_getattr(13172)。
+# 处置：vhangup → step 3.6 sigorset shim（-include 注入，有 __ASSEMBLER__ 守卫）；
+#       mq_setattr/mq_getattr → step 3.7b/3.7c mqueue shim（-I 注入 +
+#       -lqemu-mqshim 链接）。
 
 # ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
 # 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
