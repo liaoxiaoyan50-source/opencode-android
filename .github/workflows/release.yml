@@ -300,7 +300,19 @@ jobs:
             echo "gradle wrapper 已入仓, 原样使用"
           else
             echo "::warning::gradlew 未入仓, 由 CI 用 setup-gradle 安装的 gradle 自动生成 wrapper (8.7)"
-            gradle wrapper --gradle-version 8.7 --no-daemon
+            # [run#45 诊断增强] run#43/44 两轮 gradle wrapper 非零退出但零日志外带（采集
+            #   口径仅覆盖 proot/qemu）。run: 默认 bash -e 且无 pipefail —— `cmd | tee`
+            #   的退出码恒为 tee 的 0，不能判失败；改用重定向落盘 + 显式 RC + cat 回放。
+            set +e
+            gradle wrapper --gradle-version 8.7 --no-daemon > wrapper-gen.log 2>&1
+            WRAP_RC=$?
+            set -e
+            cat wrapper-gen.log
+            echo "[wrapper] gradle wrapper 退出码: WRAP_RC=${WRAP_RC}"
+            if [ "${WRAP_RC}" -ne 0 ]; then
+              echo "::error::gradle wrapper 命令非零退出 (RC=${WRAP_RC}, 完整日志已外带 wrapper-gen.log)"
+              exit 1
+            fi
             test -x ./gradlew || { echo "::error::wrapper 自动生成失败 (./gradlew 不可执行)"; exit 1; }
             grep -q 'gradle-8\.7-bin' gradle/wrapper/gradle-wrapper.properties \
               || { echo "::error::gradle-wrapper.properties 未锁定 8.7 (版本漂移防护), 中止"; exit 1; }
@@ -335,7 +347,7 @@ jobs:
           AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
           RC=0
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
-            LINE="$("$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            LINE="$(${AAPT2} dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
             echo "${apk}: ${LINE:-<attribute absent>}"
             echo "${LINE}" | grep -q '"true"' || {
               echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
@@ -399,6 +411,7 @@ jobs:
           path: |
             proot-build.log
             qemu-build.log
+            wrapper-gen.log
             gradle-build.log
           if-no-files-found: ignore
           retention-days: 7
@@ -444,6 +457,7 @@ jobs:
 
           # 2) 拷贝本轮全部 tee 日志 (存在才拷; 与 Upload failure logs artifact 口径一致)
           if [ -f proot-build.log ];  then cp -f proot-build.log  "${LOGREPO}/${JOB_DIR}/${PFX}-proot-build.log";  fi
+          if [ -f wrapper-gen.log ];  then cp -f wrapper-gen.log  "${LOGREPO}/${JOB_DIR}/${PFX}-wrapper-gen.log";  fi
           if [ -f qemu-build.log ];   then cp -f qemu-build.log   "${LOGREPO}/${JOB_DIR}/${PFX}-qemu-build.log";   fi
           if [ -f gradle-build.log ]; then cp -f gradle-build.log "${LOGREPO}/${JOB_DIR}/${PFX}-gradle-build.log"; fi
 
