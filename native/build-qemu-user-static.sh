@@ -504,6 +504,21 @@ fi
 #     同一 -include 即可罩住。
 #   * 与 run#35 的 __unused「裸 #define 覆盖命令行 -D」问题**本质不同**：
 #     那是宏冲突（命令行方案必然被覆盖），这是缺失函数（-include 注入不会被顶掉）。
+#
+# 【run#37 自伤修复 · -include 会波及 .S 汇编输入】
+#   run#37 用本 shim 后反而退到 [303/374]（低于 run#36 的 366/374），失败目标是
+#     libcommon.a.p/common-user_safe-syscall.S.o（源 = ../common-user/safe-syscall.S）
+#   报错：signal.h:149:23: error: unexpected token in argument list
+#         bionic-sigorset-shim.h:18:1: error: unrecognized instruction mnemonic
+#   根因：-include 是 driver 级 flag，对【汇编 .S 输入同样生效】——汇编器把 C 头
+#     当汇编解析。本地实测 `clang --target=... -include <C头> -c x.S` 精确复现。
+#   机理：--extra-cflags 折进 meson c_args，而 c_args 作用于该 target 的**所有语言**
+#     （含 .S），故 -include 无法避免波及汇编。
+#     （对照：-Wno-error=* 对 .S 无害 —— 实测汇编+这些 flag 正常通过。）
+#   修法：.S 由 clang 预处理并定义 __ASSEMBLER__（.c 不定义），故在 shim 内用
+#     #ifndef __ASSEMBLER__ 整体包住 → 汇编输入下本头展开为空，零副作用。
+#   本地四向验证：.S 静默通过 / .c shim 生效 / 端到端实跑 sigorset ok /
+#     非 Android target 正确 #error。
 log "step 3.6/5 — 注入 bionic sigorset shim（GNU 扩展缺失补丁）"
 SHIM_HEADER="$STAGING/bionic-sigorset-shim.h"
 
@@ -526,10 +541,28 @@ awk '/sigorset[[:space:]]*\(/{f=1} END{exit !f}' "$QEMU_DIR/linux-user/signal.c"
 cat > "$SHIM_HEADER" <<'SHIM_EOF'
 /* bionic-sigorset-shim.h — 为 bionic 补 glibc GNU 扩展 sigorset()
  *
+ * 【run#37 关键修正 · 必须保留 __ASSEMBLER__ 守卫】
+ *   现象：run#37 在 [303/374] 失败，报错全在系统头与 shim 头内，形如
+ *     signal.h:149:23: error: unexpected token in argument list
+ *     bionic-sigorset-shim.h:18:1: error: unrecognized instruction mnemonic
+ *   根因：-include 是 **driver 级 flag**，对同 target 的【汇编输入 .S 同样生效】。
+ *     失败目标正是 libcommon.a.p/common-user_safe-syscall.S.o
+ *     （源文件 ../common-user/safe-syscall.S）。汇编器试图把 C 头当汇编解析。
+ *     本地实测：`clang --target=... -include <C头> -c x.S` 精确复现同款报错。
+ *   机理：--extra-cflags 被 qemu 折进 meson c_args，而 meson 的 c_args 会应用到
+ *     该 target 的**所有语言**（含 .S），故 -include 无法避免波及汇编。
+ *     （注：-Wno-error=* 对 .S 无害，实测汇编+这些 flag 正常通过；只有 -include 有害。）
+ *   修法：.S 由 clang 预处理并定义 __ASSEMBLER__，.c 不定义。
+ *     用 #ifndef __ASSEMBLER__ 整体包住本头 → 汇编输入下展开为空，零副作用。
+ *     本地四向验证：.S 静默通过 / .c shim 生效 / 端到端实跑 sigorset ok /
+ *     非 Android target 正确 #error。
+ *
  * 门控说明：NDK clang 只定义 __ANDROID__，不定义 __BIONIC__；
  *   __BIONIC__ 由 sysroot sys/cdefs.h 经 <signal.h> 传递。
  *   故本头必须自行 #include <signal.h>，否则 __BIONIC__ 不可见、门控恒假。
  */
+#ifndef __ASSEMBLER__
+
 #if !defined(__linux__) || (!defined(__ANDROID__) && !defined(__BIONIC__))
 #  error "bionic-sigorset-shim.h 仅应在 Android/bionic 构建中注入"
 #endif
@@ -553,6 +586,8 @@ static __inline__ int sigorset(sigset_t *set, const sigset_t *left, const sigset
 }
 #  endif
 #endif
+
+#endif /* !__ASSEMBLER__ */
 SHIM_EOF
 [[ -s "$SHIM_HEADER" ]] || die "shim 头生成失败: $SHIM_HEADER"
 log "  [shim] 已生成 $SHIM_HEADER（$(wc -c < "$SHIM_HEADER") 字节）"
