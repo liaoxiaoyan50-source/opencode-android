@@ -149,8 +149,21 @@ cpp_args = ['-I$STAGING/include']
 cpp_link_args = ['-L$STAGING/lib', '$ALIGN_LDFLAG']
 
 [host_machine]
+# cpu_family 是 meson>=1.x 的强制键；run#26 因缺失直接报
+#   "Machine info ... is missing {'cpu_family'}" 而中断（唯一阻断点）。
 system = 'linux'      # qemu/meson 按 linux 分支走 host 侧代码；bionic 由编译器 triple 决定
+cpu_family = 'aarch64'
 cpu = 'aarch64'
+endian = 'little'
+
+# build_machine 显式声明：CI runner 恒为 x86_64；不写则 meson 回退 uname 探测，
+# 1.3+ 会对交叉编译发 "missing cpu_family for build" 警告，且 uname 行为随 runners
+# 镜像漂移。显式化成本为零、收益确定。（[target_machine] 刻意不写：qemu-user 下
+# host_machine 即 guest 语义，写 target_machine 会触发 meson 三方一致性校验）
+[build_machine]
+system = 'linux'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
 endian = 'little'
 
 [built-in options]
@@ -208,6 +221,11 @@ if [[ ! -f "$STAGING/lib/libpcre2-8.a" ]]; then
 fi
 
 # 1d. glib（meson 交叉；qemu-user 硬依赖 glib-2.0 >= 2.56）
+# 前置守卫（glib 2.78.4 硬编码 dependency('iconv')）：libiconv 1.17 的
+# autotools install 应产出 $STAGING/lib/pkgconfig/iconv.pc；若缺失，
+# glib configure 会报 iconv not found。此处提前失败并给可操作提示。
+[[ -f "$STAGING/lib/pkgconfig/iconv.pc" ]] \
+  || die "缺少 $STAGING/lib/pkgconfig/iconv.pc：libiconv 1.17 未正确 install（glib 2.78.4 硬依赖 dependency('iconv')）"
 GLIB_DIR="$BUILD_DIR/glib-$GLIB_VERSION"
 if [[ ! -f "$STAGING/lib/libglib-2.0.a" ]]; then
   fetch "https://download.gnome.org/sources/glib/2.78/glib-${GLIB_VERSION}.tar.xz" \
@@ -216,6 +234,18 @@ if [[ ! -f "$STAGING/lib/libglib-2.0.a" ]]; then
   (
     cd "$GLIB_DIR"
     rm -rf build-glib
+    # 【本命令刻意不含 iconv 选项】glib 2.78.4 源码实测无 iconv option：
+    #   * meson_options.txt 全文无 option('iconv', ...)：2.58 时代曾有
+    #     libc/gnu/native 取值域，2.78 已移除，网上的旧资料勿套用；
+    #   * meson.build L2071-2081 非 Windows 平台为硬编码唯一路径：
+    #         else
+    #           libiconv = dependency('iconv')
+    #     该依赖默认走 pkg-config 探测，经 cross file 的
+    #     pkg_config_libdir=$STAGING/lib/pkgconfig + pkg-config --static
+    #     wrapper，自动命中 step1b 安装的 GNU libiconv 1.17（无需任何开关）。
+    #   若误传 -Diconv=... → meson 1.6.1 直接
+    #     ERROR: Unknown options: "iconv"
+    #   阻断 configure（与 run#26 的 cpu_family 同类，属必然失败）。
     meson setup build-glib \
       --cross-file "$CROSS_FILE" \
       --prefix "$STAGING" \
@@ -223,8 +253,7 @@ if [[ ! -f "$STAGING/lib/libglib-2.0.a" ]]; then
       -Dgtk_doc=false -Dman=false \
       -Dselinux=disabled -Dlibmount=disabled \
       -Dnls=false -Ddtrace=false -Dsystemtap=false \
-      -Dforce_posix_threads=true \
-      -Diconv=native   # 指向 step1b 的 GNU libiconv（libc iconv 仅 API28+）
+      -Dforce_posix_threads=true
     ninja -C build-glib
     ninja -C build-glib install
   )
@@ -295,9 +324,12 @@ CPU_PARAM="$QEMU_DIR/target/arm/cpu-param.h"
 grep -q 'TARGET_PAGE_BITS_VARY' "$CPU_PARAM" \
   || die "cpu-param.h 无 TARGET_PAGE_BITS_VARY：qemu < 9.0 或结构变更，16KB host page 将 MAP_FIXED 失败（D7）"
 USER_BLOCK="$(sed -n '/#ifdef CONFIG_USER_ONLY/,/#else/p' "$CPU_PARAM")"
-printf '%s\n' "$USER_BLOCK" | grep -q 'TARGET_AARCH64' \
+# 断言编写铁律（D-C3-R4）：一律 awk 全量消费 + 落原文，禁用管道 grep -q
+printf '%s\n' "$USER_BLOCK" \
+  | awk '/TARGET_AARCH64/{f=1} {print} END{exit !f}' \
   || die "TARGET_PAGE_BITS_VARY 不在 CONFIG_USER_ONLY+TARGET_AARCH64 分支内，无法保证 aarch64 linux-user 生效"
-printf '%s\n' "$USER_BLOCK" | grep -q 'TARGET_PAGE_BITS_MIN' \
+printf '%s\n' "$USER_BLOCK" \
+  | awk '/TARGET_PAGE_BITS_MIN/{f=1} {print} END{exit !f}' \
   || die "缺少 TARGET_PAGE_BITS_MIN（page-vary 机制不完整）"
 log "断言通过，cpu-param.h 相关定义："
 printf '%s\n' "$USER_BLOCK" | grep -E 'TARGET_PAGE_BITS|TARGET_AARCH64' | sed 's/^/    /'
@@ -336,9 +368,10 @@ QEMU_BIN="$QEMU_DIR/build/qemu-aarch64"
 [[ -s "$QEMU_BIN" ]] || die "qemu 产物缺失: $QEMU_BIN"
 "$STRIP" "$QEMU_BIN"
 
-# (a) 架构断言
-"$READELF" -h "$QEMU_BIN" | grep -q 'Machine:.*AArch64' \
-  || die "架构断言失败：产物不是 AArch64"
+# (a) 架构断言（D-C3-R4：awk 全量消费 + readelf 原文落日志）
+"$READELF" -h "$QEMU_BIN" \
+  | awk '/Machine:.*AArch64/{f=1} {print} END{exit !f}' \
+  || die "架构断言失败：产物不是 AArch64（上方为 readelf 原始头信息）"
 
 # (b) C3 静态断言：NEEDED 必须为 0
 NEEDED="$("$READELF" -d "$QEMU_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
