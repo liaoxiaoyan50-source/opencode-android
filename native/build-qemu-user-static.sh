@@ -472,7 +472,6 @@ fi
 #       [-Wimplicit-function-declaration]
 #     219 |             sigorset(&ts->signal_mask, &ts->signal_mask, set);
 #   ../linux-user/signal.c:1311:9: error: (同上)
-#     1311 |         sigorset(&ts->signal_mask, blocked_set, &set);
 #
 # 根因证据链（全部本地实测）：
 #   证据1 sigorset 是 glibc 的 GNU 扩展（signal.h 非 POSIX 部分），bionic 全无。
@@ -1080,6 +1079,120 @@ log "step 3.8/5 完成（semun 门控 + msqid64_ds 条件编译 + sys/mount.h �
 #       mq_setattr/mq_getattr → step 3.7b/3.7c mqueue shim（-I 注入 +
 #       -lqemu-mqshim 链接）。
 
+# ══════════════════ run#42 结论记录（step 3.9 CI 验证 + 本轮处置） ═════════════
+# step 3.9 三 shim CI 验证全绿：编译 374/374 首次全部通过（run#36→#42 一路
+#   366→373→374），qemu 进入链接期。
+# 新阻断点 1 个（链接期）：ld.lld: error: duplicate symbol: memfd_create
+#   >>> defined at memfd.c:41 (../util/memfd.c:41)  ← qemu fallback（libqemuutil.a）
+#   >>> defined at syscalls-arm64.S:368             ← NDK 30 合并 libc.a
+# 处置：step 3.10 qemu fallback __attribute__((weak)) 化（精准最小，见下段）。
+
+# ══════════════════ 第 3.10 步：qemu memfd_create fallback weak 化（run#42 实锤）═══
+# 【run#42 根因修复 · 主理人三向验证定案】链接期 duplicate symbol: memfd_create，
+#   现象（CI 逐字）：
+#     ld.lld: error: duplicate symbol: memfd_create
+#       >>> defined at memfd.c:41 (../util/memfd.c:41)   ← qemu fallback（libqemuutil.a）
+#       >>> defined at syscalls-arm64.S:368              ← NDK 30 合并 libc.a
+#   根因链（主理人已完成全部根因定位与三向验证，本地逐项复现）：
+#     (1) qemu meson.build:2752 探测 CONFIG_MEMFD，探测源码逐字：
+#           #define _GNU_SOURCE / #include <sys/mman.h> /
+#           int main(void){ return memfd_create("foo", MFD_ALLOW_SEALING); }
+#     (2) bionic sys/mman.h:195：memfd_create 声明包在 #if __BIONIC_AVAILABILITY_GUARD(30)
+#         内 → API 26 编译目标下该声明不可见；
+#     (3) clang 21（NDK 29/30）对 C99+ 隐式函数声明默认硬错误（clang 16+ 行为变化，
+#         非 -Werror）→ 主理人本地逐字复现报错：
+#           error: call to undeclared function 'memfd_create'
+#         → 探测 false → CONFIG_MEMFD=0；
+#     (4) qemu util/memfd.c:37-49（#if defined CONFIG_LINUX && !defined CONFIG_MEMFD
+#         分支）自带 memfd_create 强定义 fallback；
+#     (5) CI 的 NDK 30 链接用合并 libc.a（路径无 API 子目录；llvm-nm 可见
+#         T memfd_create 强符号；r29 的 26/libc.a 则没有）→ 两个强定义相撞；
+#     (6) 三向验证已 PASS：weak 生效（无强符号时取 fallback）/ weak 让位（有强符号
+#         时强胜）/ 对照组（原始强 fallback + 合并库）精确复现 duplicate。
+#   修法（已定案，不换）：qemu fallback 加 __attribute__((weak)) ——
+#     有 libc 强符号 → 用 libc 的（薄 syscall 包装，语义等价）；无 → 用 qemu weak
+#     fallback。精准最小、双分支安全。
+#   【否决项】-Wl,--allow-multiple-definition：全局放宽链接语义，违背精准修复
+#     哲学，且会掩盖未来真正的重复符号错误，否决。
+#   【预警 · 同类隐患扫描（D 项，只报告不改代码，保持逐轮可审计）】扫描
+#     $QEMU_DIR/util/ 与 $QEMU_DIR/include/qemu/ 下「CONFIG_*/HAVE_* 门控内的
+#     裸名 POSIX 函数强定义」（潜在下一个 duplicate symbol）：
+#     · 唯一命中即本处 memfd.c:39 memfd_create（#if defined CONFIG_LINUX &&
+#       !defined CONFIG_MEMFD；glibc ≥2.27 有、bionic API 30+ 有/API 26 不可见）
+#       —— 本步 weak 化后清零；
+#     · cutils.c:776 qemu_strchrnul（#ifndef HAVE_STRCHRNUL）/ getauxval.c:34
+#       qemu_getauxval（#ifdef CONFIG_GETAUXVAL）：均带 qemu_ 前缀，无冲突风险；
+#     · cacheflush.c:242/260 flush_idcache_range（Darwin / i386|x86_64|s390 门控）：
+#       裸名但非 libc 符号（glibc/bionic 均无此符号），aarch64-linux 走
+#       __builtin___clear_cache 分支，无定义，无冲突；
+#     · osdep.h:822 #ifndef HAVE_SYSTEM_FUNCTION：#define system 重定向 + static
+#       inline，无强符号；osdep.h:633 #ifndef CONFIG_IOVEC：仅 struct iovec 定义 +
+#       readv/writev 声明（非定义），无链接冲突；
+#     · log.c:70 CONFIG_GETTID / qemu-timer.c:37 CONFIG_PPOLL / rcu.c:35
+#       CONFIG_MALLOC_TRIM / compatfd.c:19 CONFIG_SIGNALFD / oslib-posix.c:866
+#       CONFIG_CLOSE_RANGE：门控内仅 include 头文件或调用 libc 函数，无裸名定义。
+#     结论：本范围内同类隐患清零。qemu 上游约定 fallback 加 qemu_ 前缀
+#     （qemu_strchrnul/qemu_getauxval 皆范例），memfd_create 是唯一例外。
+# 统一风格：前置断言 → 幂等早退（独有标记串锚定）→ awk 改写（temp+mv 原子替换）→
+#   后置断言 → 中文机理注释。D-C3-R4：禁用 | grep -q，一律 awk 全量消费 / $() 计数。
+
+# ── 3.10a 源码补丁：util/memfd.c fallback 加 __attribute__((weak)) ──
+MFDC="$QEMU_DIR/util/memfd.c"
+[[ -f "$MFDC" ]] || die "qemu 源码结构漂移：缺 util/memfd.c"
+# 前置断言：CONFIG_MEMFD 门控行存在（补丁后 weak 定义仍在门控内，幂等跳过时同样成立）
+awk '/^#if defined CONFIG_LINUX && !defined CONFIG_MEMFD$/{f=1} END{exit !f}' "$MFDC" \
+  || die "memfd.c 未见 CONFIG_LINUX && !CONFIG_MEMFD 门控：qemu 版本漂移，请复核 QEMU_REF"
+# 幂等判据：锚定【本补丁独有标记串】（weak 形态签名行，上游不会有）。
+#   ★ 幂等判据必须优先于「强定义锚点」断言：补丁后强定义已变 weak 形态、锚点消失，
+#     若锚点断言前置，重跑会假 FATAL（本轮 dry-run PASS 2 复现此坑，与 step 3.8b
+#     「幂等判据优先于严格前置计数」同款教训）。
+if awk '/^int __attribute__\(\(weak\)\) memfd_create\(/{f=1} END{exit !f}' "$MFDC"; then
+  log "  memfd_create 已 weak 化（前次已打补丁，幂等跳过）"
+else
+  # 前置断言 2：原始强定义锚点存在（保证 awk 改写精确命中、不空转；未打补丁时恒真）
+  awk '/^int memfd_create\(const char \*name, unsigned int flags\)$/{f=1} END{exit !f}' "$MFDC" \
+    || die "memfd.c 未见 memfd_create 强定义锚点（应改写前存在）"
+  # awk 重写（temp+mv 原子替换）：#include <asm/unistd.h> 后插两行机理注释；
+  #   强定义签名行原位改 weak 形态。END 校验两个动作均命中（任一未命中 = 结构
+  #   漂移，fail loudly，防静默空转）。
+  awk '
+    /^#include <asm\/unistd.h>$/ {
+      print
+      print "/* __attribute__((weak)): NDK 30 合并 libc.a 含同名强符号（run#42 duplicate symbol），"
+      print " * weak 让位给 libc 强定义；无强符号环境（API 特定 libc.a）回退本 syscall 实现。 */"
+      ins=1; next
+    }
+    /^int memfd_create\(const char \*name, unsigned int flags\)$/ {
+      print "int __attribute__((weak)) memfd_create(const char *name, unsigned int flags)"
+      rep=1; next
+    }
+    { print }
+    END { exit !(ins && rep) }
+  ' "$MFDC" > "$MFDC.qemu-tmp" && mv "$MFDC.qemu-tmp" "$MFDC" \
+    || die "memfd_create weak 化补丁失败（awk 重写或结构漂移）"
+  log "  memfd_create fallback 已 weak 化（有 libc 强符号让位，无则回退本 syscall 实现）"
+fi
+# 后置断言 1：weak 形态恰好 1（防重复插入/错位）
+[[ "$(grep -c '^int __attribute__((weak)) memfd_create(' "$MFDC" || true)" == 1 ]] \
+  || die "memfd_create weak 形态计数 ≠1（应为 1）"
+# 后置断言 2：原强形态归 0（$() 内 || true 吞 grep rc=1，保计数语义；
+#   weak 版行首为 int __attribute__，不会被 ^int memfd_create( 误计）
+[[ "$(grep -c '^int memfd_create(' "$MFDC" || true)" == 0 ]] \
+  || die "memfd_create 原强形态残留（应归 0）"
+# 后置断言 3：中文机理注释标记恰好 1（防注释丢失/重复）
+[[ "$(grep -c 'weak 让位给 libc 强定义' "$MFDC" || true)" == 1 ]] \
+  || die "weak 注释标记计数 ≠1（应恰好 1）"
+# 顺序断言：门控行 < 注释 < weak 定义（改写必须仍落在 CONFIG_MEMFD 门控块内；
+#   挪出门控会无条件定义裸名 memfd_create，glibc 环境反而制造 duplicate）
+awk '
+  /^#if defined CONFIG_LINUX && !defined CONFIG_MEMFD$/ { g=NR }
+  /^\/\* __attribute__\(\(weak\)\): NDK 30/             { c=NR }
+  /^int __attribute__\(\(weak\)\) memfd_create\(/       { w=NR }
+  END { printf "  顺序断言：门控 L%d < 注释 L%d < weak L%d\n", g, c, w; exit !(g && c && w && g<c && c<w) }
+' "$MFDC" || die "weak 定义落点错误（未落在 CONFIG_MEMFD 门控块内）"
+log "step 3.10/5 完成（memfd_create fallback weak 化，链接期 duplicate symbol 清除）"
+
+
 # ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
 # 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
 #   ERROR: unknown option --cross-file
@@ -1157,7 +1270,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
   #     ① 只降级保留告警文字（CI 可 grep '-Wdeprecated-declarations'），真问题不静默；
   #     ② 【关键实证·范围】该诊断类在本次 --target-list=aarch64-linux-user +
   #        --without-default-features + --disable-slirp 的【编译图内命中面 = 仅
-  #        hw/core/cpu-common.c 一个文件】（主理人已独立复核）：
+n        hw/core/cpu-common.c 一个文件】（主理人已独立复核）：
   #          - 全树 strtok( 共 84 处，其中 roms/ 74 处（u-boot/edk2/SLOF/skiboot/
   #            ipxe/openbios），交叉编译不进图；
   #          - 非 roms 仅 10 处，逐一验证均不在图：
@@ -1289,7 +1402,7 @@ QEMU_BIN="$QEMU_DIR/build/qemu-aarch64"
   || die "架构断言失败：产物不是 AArch64（上方为 readelf 原始头信息）"
 
 # (b) C3 静态断言：NEEDED 必须为 0
-NEEDED="$("$READELF" -d "$QEMU_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
+NEEDED="$($"$READELF" -d "$QEMU_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3 --static）：
 $NEEDED"
