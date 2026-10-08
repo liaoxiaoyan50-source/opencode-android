@@ -463,6 +463,100 @@ else
   log "  裸 __unused 已不存在（前次已打补丁，幂等跳过）"
 fi
 
+# ══════════════════ 第 3.6 步：bionic sigorset GNU 扩展 shim（run#36 实锤） ═══
+# 【run#36 根因修复】run#36 推进到 [366/374]，仅剩一个阻断点（真实语义缺失，非告警）：
+#   [363/374] Compiling C object libqemu-aarch64-linux-user.a.p/linux-user_signal.c.o
+#   FAILED: [code=1] ...
+#   ../linux-user/signal.c:219:13: error: call to undeclared function 'sigorset';
+#       ISO C99 and later do not support implicit function declarations
+#       [-Wimplicit-function-declaration]
+#     219 |             sigorset(&ts->signal_mask, &ts->signal_mask, set);
+#   ../linux-user/signal.c:1311:9: error: (同上)
+#     1311 |         sigorset(&ts->signal_mask, blocked_set, &set);
+#
+# 根因证据链（全部本地实测）：
+#   证据1 sigorset 是 glibc 的 GNU 扩展（signal.h 非 POSIX 部分），bionic 全无。
+#        实测：全 NDK sysroot grep 'sigorset|sigandset|sigisemptyset' 零命中；
+#        bionic signal.h 仅有 sigaddset/sigdelset/sigemptyset/sigfillset/sigismember。
+#   证据2 qemu v9.2 全树 sigorset 仅 2 处（linux-user/signal.c:217 & 1309），
+#        include/ / common-user/ / target/ 全扫无间接依赖。
+#   证据3 ts->signal_mask 类型 = host 的 sigset_t（linux-user/qemu.h:142），
+#        故只需补「host sigset_t 版」sigorset，无需碰 target_sigset_t。
+#   证据4 ★【推翻「按位或」直觉】bionic aarch64 的 sigset_t 是
+#           typedef struct { unsigned long sig[_NSIG_WORDS]; } sigset_t;
+#         （asm-generic/signal.h:55-58）—— 不透明结构体。
+#         实测 `*s = *l | *r;` 编译报
+#           error: invalid operands to binary expression ('const sigset_t' and ...)
+#         → shim 必须用 sigismember/sigaddset 遍历信号号，**不可位运算**。
+#   证据5 NSIG 由 bits/signal_types.h:54 定义为 65（非 64！），
+#         _KERNEL__NSIG=64、_NSIG_WORDS=1。故循环上界用 `sig < NSIG` 覆盖到 64。
+#         ★ 本地实跑验证（qemu-aarch64-static 执行 aarch64 静态可执行）：
+#           rc=0 | SIGINT=1 SIGTERM=1 SIGRTMAX(64)=1 SIGKILL(不该有)=0
+#         —— 并集正确、边界信号 64 命中、未设信号不误置。
+#   证据6 门控陷阱：NDK clang 只定义 __ANDROID__，**不定义 __BIONIC__**；
+#         __BIONIC__ 由 sysroot sys/cdefs.h 经 <signal.h> 传递。
+#         → shim 头**必须自行 #include <signal.h>**，否则门控恒假、shim 不生效。
+#
+# 方案抉择：路线 B（-include staging shim）优于「改 signal.c」：
+#   * 幂等 0 成本：cat > 覆盖写，重跑无「重复插入」隐患（对比 step 2.5 的 sed -i 插入）；
+#   * 不脏 qemu 树：KEEP_BUILD=1 重跑时源码保持干净，diff 可审计；
+#   * 覆盖可扩展：未来 linux-user/ 若再现 sigandset/sigisemptyset（当前各 0 处）
+#     同一 -include 即可罩住。
+#   * 与 run#35 的 __unused「裸 #define 覆盖命令行 -D」问题**本质不同**：
+#     那是宏冲突（命令行方案必然被覆盖），这是缺失函数（-include 注入不会被顶掉）。
+log "step 3.6/5 — 注入 bionic sigorset shim（GNU 扩展缺失补丁）"
+SHIM_HEADER="$STAGING/bionic-sigorset-shim.h"
+
+# (a) 前置断言：bionic 确实缺失 sigorset（防上游/新版 NDK 已提供 → 重复定义）
+_BIONIC_SIGNAL_H="$TOOLCHAIN/sysroot/usr/include/signal.h"
+[[ -f "$_BIONIC_SIGNAL_H" ]] || die "未找到 bionic signal.h: $_BIONIC_SIGNAL_H"
+_BIONIC_HAS_SIGORSET=0
+for _h in "$_BIONIC_SIGNAL_H" "$TOOLCHAIN/sysroot/usr/include/bits/signal_types.h"; do
+  [[ -f "$_h" ]] || continue
+  if awk '/sigorset/{f=1} END{exit !f}' "$_h"; then _BIONIC_HAS_SIGORSET=1; fi
+done
+[[ "$_BIONIC_HAS_SIGORSET" == 0 ]] \
+  || die "bionic 已自带 sigorset（NDK 已更新）：shim 会重复定义，请复核 NDK 版本与 qemu 适配"
+
+# (b) 前置断言：qemu 侧确有 sigorset 调用（防 qemu 版本漂移后 shim 变成空转）
+awk '/sigorset[[:space:]]*\(/{f=1} END{exit !f}' "$QEMU_DIR/linux-user/signal.c" \
+  || die "signal.c 内未见 sigorset 调用：qemu 源码结构漂移，请复核 step 2 的 QEMU_REF"
+
+# (c) 幂等生成 shim（覆盖写 → 重跑安全）
+cat > "$SHIM_HEADER" <<'SHIM_EOF'
+/* bionic-sigorset-shim.h — 为 bionic 补 glibc GNU 扩展 sigorset()
+ *
+ * 门控说明：NDK clang 只定义 __ANDROID__，不定义 __BIONIC__；
+ *   __BIONIC__ 由 sysroot sys/cdefs.h 经 <signal.h> 传递。
+ *   故本头必须自行 #include <signal.h>，否则 __BIONIC__ 不可见、门控恒假。
+ */
+#if !defined(__linux__) || (!defined(__ANDROID__) && !defined(__BIONIC__))
+#  error "bionic-sigorset-shim.h 仅应在 Android/bionic 构建中注入"
+#endif
+#include <signal.h>     /* 关键：引入 sigset_t / NSIG / __BIONIC__ 定义 */
+#include <errno.h>
+
+/* 语义对齐 glibc：*set = *left | *right；成功返回 0，失败返回 -1 且 errno=EINVAL。
+ * bionic 无 sigorset，且 sigset_t 是不透明结构体（不可按位或），只能遍历信号号。 */
+#if defined(__BIONIC__) || defined(__ANDROID__)
+#  ifndef sigorset
+static __inline__ int sigorset(sigset_t *set, const sigset_t *left, const sigset_t *right)
+{
+    int sig;
+    sigemptyset(set);
+    for (sig = 1; sig < NSIG; ++sig) {
+        if (sigismember(left, sig) == 1 || sigismember(right, sig) == 1) {
+            if (sigaddset(set, sig) != 0) { errno = EINVAL; return -1; }
+        }
+    }
+    return 0;
+}
+#  endif
+#endif
+SHIM_EOF
+[[ -s "$SHIM_HEADER" ]] || die "shim 头生成失败: $SHIM_HEADER"
+log "  [shim] 已生成 $SHIM_HEADER（$(wc -c < "$SHIM_HEADER") 字节）"
+
 # ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
 # 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
 #   ERROR: unknown option --cross-file
@@ -608,7 +702,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
     --disable-docs --disable-tools --disable-guest-agent \
     --disable-capstone --disable-gnutls --disable-gcrypt --disable-nettle \
     --disable-seccomp --disable-curl --disable-libssh --disable-slirp \
-    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe -Wno-error=deprecated-declarations -Wno-error=constant-conversion" \
+    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe -Wno-error=deprecated-declarations -Wno-error=constant-conversion -include $SHIM_HEADER" \
     --extra-ldflags="$ALIGN_LDFLAG" \
     --with-pkgversion="OpenCode-Android-$QEMU_REF" \
     || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
