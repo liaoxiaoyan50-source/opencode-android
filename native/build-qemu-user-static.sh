@@ -378,6 +378,91 @@ printf '%s\n' "$USER_BLOCK" \
 log "断言通过，cpu-param.h 相关定义："
 printf '%s\n' "$USER_BLOCK" | grep -E 'TARGET_PAGE_BITS|TARGET_AARCH64' | sed 's/^/    /'
 
+# ══════════════════ 第 3.5 步：bionic __unused 宏冲突修补（Android 平台特有） ══
+# 【run#35 根因修复】run#35 首次进入 [304/374]，失败为**真实语法错误**（非告警升级）：
+#   ../linux-user/syscall_defs.h:1929:22: error: expected member name or ';' after
+#       declaration specifiers
+#     1929 |     abi_uint __unused[2];
+#   ../linux-user/aarch64/signal.c:44:18: error: (同上)
+#   ../linux-user/aarch64/signal.c:538:26: error: implicit conversion from
+#       'unsigned long' to 'int' changes value from 18446744073709551609 to -7
+#       [-Werror,-Wconstant-conversion]
+#
+# 根因（已逐字实证）：NDK bionic <sys/cdefs.h> 第 105 行为**裸 define**（无 #ifndef 守卫）：
+#     #define __unused __attribute__((__unused__))
+#   于是 qemu 的 `abi_uint __unused[2];` 展开为
+#     `abi_uint __attribute__((__unused__))[2];`
+#   属性落在**数组声明符**位置 → clang 报「expected member name or ';'」。
+#   glibc 下 __unused 不是宏（是 qemu 自己声明的普通成员名），故上游 qemu 从不触发
+#   —— 纯 Android 平台特有的宏冲突。本地 clang 逐字复现：
+#     #include <sys/cdefs.h> / typedef unsigned int abi_uint;
+#     struct S { abi_uint __unused[2]; };
+#     → 与 run#35 日志错误原文完全一致。
+#
+# 方案抉择（三条路线本地实测，**路线 B/C 被证伪**）：
+#   A. 源码改名 __unused → __qemu_unused .................. PASS（唯一可行）
+#   B. --extra-cflags 加 -D__unused= ..................... FAIL
+#      （cdefs.h 裸 #define 无 #ifndef 守卫，include 时无条件覆盖命令行 -D；
+#        连 -U__unused -D__unused= 组合也实测 FAIL —— 顺序无解）
+#   C. -include 一个 shim 头先 #undef 再重定义 ............ FAIL
+#      （shim 生效于 cdefs 之前，cdefs include 时又改回属性宏）
+#   机理：-D/-include 都发生在 <sys/cdefs.h> 被包含**之前**，而 cdefs 是无守卫裸
+#   #define → 命令行方案必然被覆盖。故唯一出路是改源码。
+#
+# 受影响面（grep -rnE '\b__unused\b' 精确词边界）= 10 处，全在 linux-user/：
+#   ✅ 在 aarch64 编图内（run#35 直接报错）：
+#      - linux-user/syscall_defs.h:1929   （TARGET_AARCH64 的 target_stat 分支）
+#      - linux-user/aarch64/signal.c:43   （target_rt_sigframe 的 pad 成员）
+#   ⬜ 不在当前编图（他架构 / 条件编译未命中），但一并改以防版本漂移：
+#      - linux-user/syscall_defs.h:1798 / 1885 / 1906
+#      - linux-user/riscv/signal.c:48
+#      - linux-user/arm/signal.c:57
+#      - linux-user/loongarch64/signal.c:74
+#      - linux-user/sparc/target_fcntl.h:41 / 42
+#   ⚠️ 严禁误伤：全树另有 ~100 处带数字后缀的 __unused1 / __unused2 … __unused6
+#      （如 linux-user/ppc/target_structs.h）。宏名精确匹配，这些**不受 bionic 影响**，
+#      改了反而破坏结构体成员布局语义。故 sed 与断言**必须**用精确词边界 \b__unused\b。
+#
+# 幂等语义：KEEP_BUILD=1 / 同 workspace 重跑时源码可能已改。此时「未找到裸 __unused」
+#   属**正常已打补丁状态**，应静默跳过而非 die —— 只有「既未改名又改名失败」才是异常。
+log "step 3.5/5 — 修补 bionic __unused 宏冲突（源码改名，Android 平台特有）"
+UNUSED_TARGETS=(
+  "linux-user/syscall_defs.h"
+  "linux-user/aarch64/signal.c"
+  "linux-user/riscv/signal.c"
+  "linux-user/arm/signal.c"
+  "linux-user/loongarch64/signal.c"
+  "linux-user/sparc/target_fcntl.h"
+)
+for _rel in "${UNUSED_TARGETS[@]}"; do
+  [[ -f "$QEMU_DIR/$_rel" ]] \
+    || die "qemu 源码结构漂移：缺 $_rel（无法打 __unused 补丁，拒绝静默产出不可用库）"
+done
+# 前置探针：全树是否仍存在裸 __unused（精确词边界）。
+#   用 \b 而非裸 __unused —— 否则 __unused1 等会让「0 残留」检查永远非空而误 die。
+#   D-C3-R4：一律 awk 全量消费 + 落原文，禁用管道上的 grep -q 静默模式。
+_UNUSED_HITS="$(grep -rnE '\b__unused\b' "$QEMU_DIR/linux-user" || true)"
+if printf '%s\n' "$_UNUSED_HITS" | awk '/__unused/{f=1} END{exit !f}'; then
+  # 幂等改名（sed -i 重复执行不累积破坏；\b 保证 __unused1 不被误伤）
+  for _rel in "${UNUSED_TARGETS[@]}"; do
+    sed -i 's/\b__unused\b/__qemu_unused/g' "$QEMU_DIR/$_rel" \
+      || die "sed 改名失败: $_rel"
+  done
+  # 收尾断言：全树不得再残留裸 __unused（否则 bionic 宏将再次触发语法错误）
+  _UNUSED_REMAIN="$(grep -rnE '\b__unused\b' "$QEMU_DIR/linux-user" || true)"
+  if printf '%s\n' "$_UNUSED_REMAIN" | awk '/__unused/{f=1} END{exit !f}'; then
+    die "补丁后仍残留裸 __unused（bionic 宏将再次触发语法错误）：
+$_UNUSED_REMAIN"
+  fi
+  # 正向断言：改名结果确实落地（防 sed 静默无效）。D-C3-R4：用 awk 全量消费，避免 -q 静默。
+  _UNUSED_NEW="$(grep -rnE '\b__qemu_unused\b' "$QEMU_DIR/linux-user" || true)"
+  printf '%s\n' "$_UNUSED_NEW" | awk '/__qemu_unused/{f=1} END{exit !f}' \
+    || die "改名后未发现任何 __qemu_unused（sed 静默失效）"
+  log "  __unused → __qemu_unused 完成（命中 $(printf '%s\n' "$_UNUSED_HITS" | awk '/__unused/{n++} END{print n+0}') 处，全树零残留）"
+else
+  log "  裸 __unused 已不存在（前次已打补丁，幂等跳过）"
+fi
+
 # ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
 # 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
 #   ERROR: unknown option --cross-file
@@ -478,6 +563,30 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
   #   【方法论】刻意逐轮只解决「当前 CI 实锤到的那一类诊断」，每轮新增一条
   #     -Wno-error=<单类>，不预埋一批 -Wno-*：保持修复可审计、不漏报新诊断。
   #     run#33 加 1 类、run#34 加 1 类，逐条递增，未透支。
+  #
+  # 【run#35 根因修复】新增 -Wno-error=constant-conversion 到 extra-cflags（同 tail 段）。
+  #   现象：../linux-user/aarch64/signal.c:538:26: error: implicit conversion from
+  #     'unsigned long' to 'int' changes value from 18446744073709551609 to -7
+  #     [-Werror,-Wconstant-conversion]
+  #   根因（已核源码 linux-user/aarch64/signal.c:537-538）：
+  #       const int std_size = sizeof(struct target_rt_sigframe)
+  #                            - sizeof(struct target_aarch64_ctx);
+  #     两 sizeof 相减为 size_t（unsigned long），当 rt_sigframe 比 aarch64_ctx
+  #     小 7 字节时得 -7UL → 回绕成 18446744073709551609，再隐式转 int 得 -7。
+  #     该回绕值**被下游比较逻辑依赖**（alloc_sigframe_space 里
+  #       `this_size + this_loc > std_size` 的 int/unsigned long 比较）。
+  #
+  #   修法裁决：同样用 -Wno-error=...（只降级不关闭）。
+  #     ★ 【否决改源码】：加 (int) 强转或改 ptrdiff_t 会**改变比较语义**，
+  #       属高危（上游固化行为，非我们的 bug）。降级是与 strtok/FAM 同哲学的正解。
+  #     本地实测：-Werror -Wno-error=constant-conversion → 警告保留、exit=0 ✅。
+  #
+  #   注：signal.c:44 的 `char __unused[...]` 语法错误不在此处理 —— 已由 step 3.5
+  #     的源码改名根治（该错是 bionic 宏冲突，非告警，加 flag 无效）。
+  #
+  #   【本轮方法论升级】run#35 同时暴露「告警类」与「真语法错类」两种，故本轮
+  #     分两处治理：语法错 → step 3.5 改源码；告警类 → 此处加 flag。分类处置，
+  #     不再一律加 flag（对语法错加 flag 是无效的）。
   env \
     CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" STRIP="$STRIP" RANLIB="$RANLIB" \
     LD="$TOOLCHAIN/bin/ld.lld" \
@@ -499,7 +608,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
     --disable-docs --disable-tools --disable-guest-agent \
     --disable-capstone --disable-gnutls --disable-gcrypt --disable-nettle \
     --disable-seccomp --disable-curl --disable-libssh --disable-slirp \
-    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe -Wno-error=deprecated-declarations" \
+    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe -Wno-error=deprecated-declarations -Wno-error=constant-conversion" \
     --extra-ldflags="$ALIGN_LDFLAG" \
     --with-pkgversion="OpenCode-Android-$QEMU_REF" \
     || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
