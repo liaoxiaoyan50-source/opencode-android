@@ -256,7 +256,14 @@ jobs:
           fi
           IFS=. read -r VMA VMI VPA <<< "${APP_VERSION_NAME}"
           echo "APP_VERSION_NAME=${APP_VERSION_NAME}"          >> "$GITHUB_ENV"
-          echo "APP_VERSION_CODE=$(( 10#$VMA * 1000000 + 10#$VMI * 1000 + 10#$VPA ))" >> "$GITHUB_ENV"
+          # [run#45 根因修复] branch push 冒烟 0.0.0-local → APP_VERSION_CODE=0 → AGP 配置期
+          # 硬拒 "versionCode is set to 0, but it should be a positive integer" → gradle wrapper
+          # 与全部构建失败 (run#43/44/45 step 14 三连挂同一根因, wrapper-gen.log 实锤)。
+          # gradle 侧兜底是 "未注入回落 1", 被显式注入 0 绕过; 修注入端: 钳最小合法值 1。
+          # tag 路径 X.Y.Z 至少 0.0.1 → code>=1 恒真, 不受影响。
+          APP_VERSION_CODE=$(( 10#$VMA * 1000000 + 10#$VMI * 1000 + 10#$VPA ))
+          [ "${APP_VERSION_CODE}" -ge 1 ] || APP_VERSION_CODE=1
+          echo "APP_VERSION_CODE=${APP_VERSION_CODE}" >> "$GITHUB_ENV"
 
       - name: "Release blocker: third-party SHA256 must be configured"
         run: |
@@ -347,7 +354,7 @@ jobs:
           AAPT2="$(ls -d "${ANDROID_HOME}/build-tools"/*/aapt2 | sort -V | tail -n1)"
           RC=0
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
-            LINE="$(${AAPT2} dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
+            LINE="$($"$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
             echo "${apk}: ${LINE:-<attribute absent>}"
             echo "${LINE}" | grep -q '"true"' || {
               echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
