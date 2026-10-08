@@ -240,6 +240,50 @@ fi
 #     * stdio.h 族：snprintf/sprintf/sscanf/vsnprintf/fprintf/printf/puts/
 #       fputs —— 注意 snprintf 声明在 stdio.h 而非 string.h，必须分族判定
 #       补齐，否则"只插 string.h"的防御对 snprintf 类缺失根本无效。
+#     * 项目内函数族（CI run#11 实锤 + 项目内函数族）：标准库扫描覆盖不到
+#       项目内部符号。extension/sysvipc/sysvipc_shm.c L912/L918 调用
+#       libandroid_shmat_fd / libandroid_shmdt_fd（位于 #if
+#       WITH_LIBANDROID_SHMEM 分支内 = 本构建必编译路径，GNUmakefile L20-22:
+#       PROOT_WITH_LIBANDROID_SHMEM=true → CFLAGS += -DWITH_LIBANDROID_SHMEM），
+#       其 include 表（sysvipc.h/sysvipc_internal.h/tracee/*/sys/shm.h 等）
+#       无 libandroid-shmem 的 shm.h → 隐式声明，clang 19 硬错误：
+#         ./extension/sysvipc/sysvipc_shm.c:913:18: error: call to undeclared
+#           function 'libandroid_shmat_fd' [-Wimplicit-function-declaration]
+#       （CI 行号 913/919 = 上游 912/918 + 本补丁第 1 行插入偏移 1 行，实锤
+#        同一构建内前两族补丁已生效、新符号族暴露。）
+#       取证链（v5.1.107.96 × libandroid-shmem v0.7 源码核验）：
+#         a) 声明 = libandroid-shmem 的 shm.h L34-35：
+#              extern int libandroid_shmat_fd(int shmid, size_t* out_size);
+#              extern int libandroid_shmdt_fd(int fd);
+#            定义 = 同库 shmem.c L508/L538（step1 已编入 libandroid-shmem.a，
+#            链接期由 GNUmakefile ifdef 分支追加的 -landroid-shmem 解析）。
+#            → 声明真实存在且头文件已随 step1 `install -m 644 ./*.h` 落入
+#            $STAGING/include/shm.h，走方案 A（include 补齐），方案 B
+#            （-Wno-error=implicit-function-declaration）否决：有正确头可用
+#            无需降级掩盖，且隐式声明下 size_t* 参数传递无原型保护。
+#         b) include 形式取 <shm.h>（外部依赖头，与 proot 对外部库一律 <>
+#            的惯例一致；项目内头才用 ""）。命中路径：env CPPFLAGS 的
+#            -I$STAGING/include 居 -I 序列首位（GNUmakefile 的 CPPFLAGS +=
+#            追加在其后，run#5 已验证），<> 先搜 $STAGING/include/shm.h；
+#            bionic sysroot 无顶层 shm.h（仅 sys/shm.h），proot src/ 树内
+#            亦无同名头（已 find 核验），无遮蔽风险。
+#         c) guard 短路排除：bionic <sys/shm.h> 用 #pragma once（无传统
+#            include guard），与 libandroid-shmem shm.h 的 #ifndef
+#            _SYS_SHM_H 不互斥——两头均展开，原型必然可见（shm.h 插在
+#            第 1 行、先于 sysvipc_shm.c 原有的 #include <sys/shm.h>）。
+#         d) 宏重定向副作用为零：shm.h 同时 #define shmget→libandroid_shmget
+#            等（ashmem 模拟重定向）；而 shmem.c 自身 include "shm.h"、
+#            #undef 后以 __attribute__((alias)) 同时导出 libandroid_shm* 与
+#            POSIX shm* 两套符号（指向同一 ashmem 实现）——sysvipc_shm.c 的
+#            shmget/shmctl 调用重定向与否都绑定同一实现，-landroid-shmem
+#            全覆盖，链接零漂移。
+#         e) 标识符污染排除：sysvipc_shm.c 内 shm* 仅出现于调用语句与注释
+#            （已 grep 核验），无变量/字段名冲突。
+#       全树风险面已用「调用符号 × 声明头 × include 传递闭包」扫描器复核
+#       （解析引号+尖括号 include、剥离 #define 宏体、剔除"定义在调用者
+#       自身文件"类误报）：项目内部符号的隐式声明风险有且仅有本两处调用；
+#       sysvipc.c/sysvipc_sem.c/sysvipc_msg.c 无 libandroid_*/ashv_* 调用，
+#       不命中本族。后续若再现新项目内符号族，按同模式扩展映射即可。
 #   插第 1 行安全性（已核验上游 src/GNUmakefile）：-D_GNU_SOURCE 经
 #   CPPFLAGS 放在编译命令行、先于一切头文件解析，include 顺序不影响特性宏
 #   展开；loader/loader.c 为 -ffreestanding 的 NO_LIBC_HEADER 独立代码，
@@ -266,6 +310,21 @@ while IFS= read -r -d '' f; do
 #include <stdio.h>' "$f" || die "隐式声明补丁失败: $f"
     rm -f "$f.bak"
     log "  [patch] + #include <stdio.h> ← ${f#"$PROOT_DIR"/}"
+    _PATCH_COUNT=$((_PATCH_COUNT + 1))
+  fi
+  # 第三族：项目内部函数（CI run#11 实锤 + 项目内函数族）。
+  # libandroid_shmat_fd / libandroid_shmdt_fd 的声明在 libandroid-shmem 的
+  # shm.h（step1 已随 `install -m 644 ./*.h` 装入 $STAGING/include/shm.h），
+  # 定义在 libandroid-shmem.a（-landroid-shmem 解析）。<> 形式按 -I 顺序
+  # （env CPPFLAGS 的 -I$STAGING/include 居首）必命中该头；bionic sysroot
+  # 无顶层 shm.h、src/ 树内无同名头，无遮蔽。详见上方注释块取证链 a-e。
+  # 幂等同前两族：已含 shm.h 的文件自动跳过。
+  if grep -Eq '(^|[^A-Za-z0-9_])libandroid_(shmat_fd|shmdt_fd)[[:space:]]*\(' "$f" \
+     && ! grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"]shm\.h[>"]' "$f"; then
+    sed -i.bak '1i\
+#include <shm.h> /* libandroid-shmem: libandroid_shmat_fd/shmdt_fd 声明（CI run#11 项目内函数族） */' "$f" || die "隐式声明补丁失败: $f"
+    rm -f "$f.bak"
+    log "  [patch] + #include <shm.h> ← ${f#"$PROOT_DIR"/}"
     _PATCH_COUNT=$((_PATCH_COUNT + 1))
   fi
 done < <(find "$PROOT_DIR" -type f -name '*.c' -print0)
@@ -326,7 +385,7 @@ PROOT_BIN="$PROOT_DIR/src/proot"
   || die "架构断言失败：产物不是 AArch64"
 
 # (b) C3 静态断言：NEEDED 必须为 0（零额外 .so 依赖）
-NEEDED="$("$READELF" -d "$PROOT_BIN" 2>/dev/null | awk '/NEEDED/{print}' || true)"
+NEEDED="$('$READELF' -d '$PROOT_BIN' 2>/dev/null | awk '/NEEDED/{print}' || true)"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3）：
 $NEEDED"
