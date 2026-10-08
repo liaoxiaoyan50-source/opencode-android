@@ -439,6 +439,45 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
   #
   #   【刻意只修这一处】不透支性加一批 -Wno-*：一次性堆 flag 会掩盖后续真问题、
   #     且掩盖「哪些是新诊断」的事实。让 CI 逐轮暴露下一处，保持修复可审计。
+  #
+  # 【run#34 根因修复】新增 -Wno-error=deprecated-declarations 到 extra-cflags（同 tail 段）。
+  #   现象：../hw/core/cpu-common.c:172/193: error: 'strtok' is deprecated:
+  #     strtok() is not thread-safe; use strtok_r() instead [-Werror,-Wdeprecated-declarations]
+  #   根因（已核源码 hw/core/cpu-common.c + bionic string.h:125）：
+  #     * bionic <string.h>:125 主动把 strtok 标为 __attribute__((__deprecated__,...))，
+  #       属【Android 平台特有严格检查】（glibc 不报），非上游 qemu 的 bug。
+  #     * 该 strtok 用在「解析 CPU feature 逗号分隔串」的非并发路径
+  #       （cpu-common.c L171-193），非真线程安全风险。
+  #
+  #   修法裁决：同样用 -Wno-error=...（只降级不关闭），沿用 run#33 已实证手法。
+  #     ① 只降级保留告警文字（CI 可 grep '-Wdeprecated-declarations'），真问题不静默；
+  #     ② 【关键实证·范围】该诊断类在本次 --target-list=aarch64-linux-user +
+  #        --without-default-features + --disable-slirp 的【编译图内命中面 = 仅
+  #        hw/core/cpu-common.c 一个文件】（主理人已独立复核）：
+  #          - 全树 strtok( 共 84 处，其中 roms/ 74 处（u-boot/edk2/SLOF/skiboot/
+  #            ipxe/openbios），交叉编译不进图；
+  #          - 非 roms 仅 10 处，逐一验证均不在图：
+  #              semihosting/config.c(2)   → 门控 CONFIG_SYSTEM_ONLY，linux-user 下 false
+  #              tests/qtest/libqos/*(2)   → --disable-tools 排除
+  #              target/sparc/cpu.c(2)     → 非本 guest
+  #              target/i386/cpu.c(2)      → 非本 guest
+  #              hw/core/cpu-common.c(2)   → ★ 唯一在图（common_ss，全 target 共享）
+  #          - 日志实证：net_ 目标对象数 = 0；slirp support = NO；semihosting 编译次数 = 0；
+  #            全日志 strtok 报错源仅 cpu-common.c 一处。
+  #        ⟹ (a) 的【实际生效范围 ≈ 单文件】，与源码级处理（改 strtok→strtok_r）的实际
+  #           范围等价，却零改上游、零语义风险（避免引入 saveptr/const 串边界的新 bug）。
+  #     ③ 【否决 -Wno-deprecated-declarations】：会连告警一起吞掉，丧失可见性。
+  #     ④ 【为何不用 per-file c_args】：cpu-common.c 属 common_ss（全 target 共享源），
+  #        meson 无 per-file 接口；打 c_args 到 static_library 反而范围更宽且须改上游 meson。
+  #
+  #   为何经 --extra-cflags 而非 CFLAGS：CFLAGS（4a 的 QEMU_CFLAGS）承载
+  #     -I$STAGING/include 等探测必需项，代表通用环境；--extra-cflags 是 qemu
+  #     为项目级额外 flag 预留的语义入口，归位更正且不动 4a 稳定定义。
+  #     （两条最终都进 meson c_args，位置等价，故按语义择用。）
+  #
+  #   【方法论】刻意逐轮只解决「当前 CI 实锤到的那一类诊断」，每轮新增一条
+  #     -Wno-error=<单类>，不预埋一批 -Wno-*：保持修复可审计、不漏报新诊断。
+  #     run#33 加 1 类、run#34 加 1 类，逐条递增，未透支。
   env \
     CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" STRIP="$STRIP" RANLIB="$RANLIB" \
     LD="$TOOLCHAIN/bin/ld.lld" \
@@ -460,7 +499,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
     --disable-docs --disable-tools --disable-guest-agent \
     --disable-capstone --disable-gnutls --disable-gcrypt --disable-nettle \
     --disable-seccomp --disable-curl --disable-libssh --disable-slirp \
-    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe" \
+    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe -Wno-error=deprecated-declarations" \
     --extra-ldflags="$ALIGN_LDFLAG" \
     --with-pkgversion="OpenCode-Android-$QEMU_REF" \
     || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
