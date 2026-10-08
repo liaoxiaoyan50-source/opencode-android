@@ -440,14 +440,44 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
     || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
 
   # 4c. configure 后置断言：交叉模式确实生效（防静默错配回归，依据 (c) (d)）
-  [[ -f config-meson.cross ]] \
-    || die "未生成 config-meson.cross：configure 未进入 meson 阶段（检查是否误加 --skip-meson）"
-  grep -q '^\[host_machine\]' config-meson.cross \
-    || die "config-meson.cross 缺 [host_machine]：cross_compile 未置位，--cross-prefix= 未生效"
-  grep -q "cpu = 'aarch64'" config-meson.cross \
-    || die "config-meson.cross 的 host cpu 非 aarch64：NDK clang target 异常（__aarch64__ 探针失败）"
-  log "交叉模式已生效，config-meson.cross [host_machine]："
-  sed -n '/^\[host_machine\]/,/^$/p' config-meson.cross | sed 's/^/    /'
+  # 【run#32 根因修复】原断言用相对路径 `config-meson.cross`，恒 MISSING → 误报 FATAL。
+  #   逐字依据：qemu v9.2.0 root/configure L13-59 —— 在源码树根执行 configure 时：
+  #       if test "$PWD" -ef "$source_path"; then
+  #           MARKER=build/auto-created-by-configure
+  #           cd build
+  #           exec "$source_path/configure" "$@"
+  #       fi
+  #   即 configure 会 mkdir build、cd build、再 exec 自身 → 真实工作 cwd = $QEMU_DIR/build。
+  #   后续 `mv $cross config-meson.cross` / `meson_add_machine_file` 均为相对路径，
+  #   故 cross file 落在 $QEMU_DIR/build/config-meson.cross（config.status/Makefile 同理）。
+  #   父 shell 的 cwd 因 exec 不改变（仍在 $QEMU_DIR），相对路径断言必然找不到文件。
+  #   CI run#32 反证：日志已回显 "Cross files : config-meson.cross"，且 postconf 脚本路径
+  #   含 ".../qemu-src/build/pyvenv/..." → 文件确实在 build/ 下，configure 返回码为 0。
+  #   → 全部断言改用显式 $QEMU_DIR/build/ 路径，不依赖 cwd。
+  #   注：step 5 的 QEMU_BIN 早已是 "$QEMU_DIR/build/qemu-aarch64"，此处与之对齐。
+  #
+  # 【为何保留断言而非交给 qemu 报错（对比 run#27 iconv.pc 守卫的教训）】
+  #   run#32 实证：configure 在本路径上【返回 0 并打印完整 options 表】—— 上游不报错。
+  #   若撤掉断言，误加 --skip-meson / configure 提前 return 这类错配将被静默放行，
+  #   直接进入 ninja 编出错误架构产物。iconv 守卫该删是因为它复刻了 meson 的探测算法
+  #   （与上游内部实现强耦合、易漂移）；而本断言只校验 qemu 已公开承诺的产物契约
+  #   （cross_compile=yes ⟹ 生成 config-meson.cross 且含 [host_machine]），漂移风险低。
+  #   故保留必要最小集：文件存在 + [host_machine] 段存在 + host cpu = aarch64。
+  CROSS_OUT="$QEMU_DIR/build/config-meson.cross"
+  [[ -f "$CROSS_OUT" ]] \
+    || die "未生成 $CROSS_OUT：configure 未进入 meson 阶段（检查是否误加 --skip-meson）"
+
+  # D-C3-R4：统一 awk 全量消费形态，禁用任何 | grep -q。
+  #   现状 grep -q PATTERN FILE 无管道、无 SIGPIPE 风险，但脚本其余自检（如 step 5 的
+  #   Machine 断言）已确立 awk 形态；统一可防后人误改为 `cmd | grep -q`（pipefail 下
+  #   producer 收 SIGPIPE → 141 → 假 FATAL），且 awk 会把命中行原文一并 print 到日志，
+  #   断言失败时取证信息更足。
+  awk '/^\[host_machine\]/{f=1} {print} END{exit !f}' "$CROSS_OUT" \
+    || die "$CROSS_OUT 缺 [host_machine]：cross_compile 未置位，--cross-prefix= 未生效"
+  awk "/cpu = 'aarch64'/{f=1} {print} END{exit !f}" "$CROSS_OUT" \
+    || die "$CROSS_OUT 的 host cpu 非 aarch64：NDK clang target 异常（__aarch64__ 探针失败）"
+  log "交叉模式已生效，$CROSS_OUT [host_machine]："
+  sed -n '/^\[host_machine\]/,/^$/p' "$CROSS_OUT" | sed 's/^/    /'
 
   # 4d. 编译（依据 (e)：目标名 = qemu-aarch64，产物 build/qemu-aarch64）
   ninja -C build -j"$JOBS" qemu-aarch64 \
