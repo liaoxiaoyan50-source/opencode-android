@@ -472,6 +472,7 @@ fi
 #       [-Wimplicit-function-declaration]
 #     219 |             sigorset(&ts->signal_mask, &ts->signal_mask, set);
 #   ../linux-user/signal.c:1311:9: error: (同上)
+#     1311 |         sigorset(&ts->signal_mask, blocked_set, &set);
 #
 # 根因证据链（全部本地实测）：
 #   证据1 sigorset 是 glibc 的 GNU 扩展（signal.h 非 POSIX 部分），bionic 全无。
@@ -1192,7 +1193,6 @@ awk '
 ' "$MFDC" || die "weak 定义落点错误（未落在 CONFIG_MEMFD 门控块内）"
 log "step 3.10/5 完成（memfd_create fallback weak 化，链接期 duplicate symbol 清除）"
 
-
 # ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
 # 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
 #   ERROR: unknown option --cross-file
@@ -1270,7 +1270,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
   #     ① 只降级保留告警文字（CI 可 grep '-Wdeprecated-declarations'），真问题不静默；
   #     ② 【关键实证·范围】该诊断类在本次 --target-list=aarch64-linux-user +
   #        --without-default-features + --disable-slirp 的【编译图内命中面 = 仅
-n        hw/core/cpu-common.c 一个文件】（主理人已独立复核）：
+  #        hw/core/cpu-common.c 一个文件】（主理人已独立复核）：
   #          - 全树 strtok( 共 84 处，其中 roms/ 74 处（u-boot/edk2/SLOF/skiboot/
   #            ipxe/openbios），交叉编译不进图；
   #          - 非 roms 仅 10 处，逐一验证均不在图：
