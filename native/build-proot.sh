@@ -88,7 +88,7 @@ STRIP="$TOOLCHAIN/bin/llvm-strip"
 READELF="$TOOLCHAIN/bin/llvm-readelf"
 [[ -x "$CC" ]] || die "NDK 编译器不存在: $CC"
 
-# ── sysroot 平台库搜索路径（CI run#18 根因修复）──────────────────────────────
+# ── sysroot 平台库搜索路径（CI run#18 根因修复）───────────────────────
 # run#18 报 `ld.lld: error: unable to find library -llog`（-landroid 同）：
 # 原 LDFLAGS 只挂了 -L$STAGING/lib（自建库），从未把 NDK sysroot 库目录纳入
 # 搜索路径。liblog/libandroid 是平台库，clang driver 在非 -static 下虽通常
@@ -100,7 +100,7 @@ NDK_SYSROOT_LIBDIR="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android"
 SYSROOT_LDFLAGS=""
 for _d in "$NDK_SYSROOT_LIBDIR/${API_LEVEL}" "$NDK_SYSROOT_LIBDIR"; do
   [[ -d "$_d" ]] && SYSROOT_LDFLAGS="$SYSROOT_LDFLAGS -L$_d"
-# done
+done
 [[ -n "$SYSROOT_LDFLAGS" ]] || die "未定位到 NDK sysroot 库目录: $NDK_SYSROOT_LIBDIR"
 log "sysroot -L:$SYSROOT_LDFLAGS"
 
@@ -219,8 +219,8 @@ EOF
   install -m 644 talloc.h "$STAGING/include/"
 )
 
-# ══════════════════════ 第 3 步：proot 本体（-static 静态链） ════════════════
-log "step 3/4 — 编译 proot $PROOT_REF (Termux fork, -static)"
+# ══════════════════════ 第 3 步：proot 本体 ════════════════
+log "step 3/4 — 编译 proot $PROOT_REF (Termux fork)"
 PROOT_DIR="$BUILD_DIR/proot-src"
 if [[ ! -d "$PROOT_DIR" ]]; then
   git clone --depth 1 --branch "$PROOT_REF" \
@@ -355,7 +355,7 @@ log "  [patch] 完成：共插入 $_PATCH_COUNT 处 include"
   #   -C src ............................ termux/proot 构建入口为 src/GNUmakefile
   #   PROOT_WITH_LIBANDROID_SHMEM=true .. 启用 ashmem shm 分支（引用 step1 产物）
   #   -DARG_MAX / -DVERSION ............. termux 配方原样 CPPFLAGS
-  #   半静态（ADR-C3-R2）................ 自建库 -static 吸入，系统库动态 NEEDED
+  #   半静态（ADR-C3-R2）................ 自建库静态吸入，系统库动态 NEEDED
   #   ALIGN_LDFLAG ...................... D7：16KB host page LOAD 段对齐
   #
   # ── CI run#5 根因修复（step#11 链接期 undefined reference）──────────────────
