@@ -592,6 +592,253 @@ SHIM_EOF
 [[ -s "$SHIM_HEADER" ]] || die "shim 头生成失败: $SHIM_HEADER"
 log "  [shim] 已生成 $SHIM_HEADER（$(wc -c < "$SHIM_HEADER") 字节）"
 
+# ══════════════════ 第 3.7 步：bionic sched_attr / mqueue 双补丁（run#38 实锤） ═
+# 【run#38 根因修复】run#38 推进到 [366/374] → [369/374]（safe-syscall.S 的
+#   __ASSEMBLER__ 守卫修复生效），仅剩 2 个阻断点，均落在 linux-user/syscall.c，
+#   均为 bionic/Android 平台差异（本地全部实测复核）：
+#
+# ── 问题 1：struct sched_attr 重复定义 ──────────────────────────────────────
+#   ../linux-user/syscall.c:364:8: error: redefinition of 'sched_attr'
+#   ../sysroot/usr/include/linux/sched/types.h:12:8: note: previous definition is here
+#   证据1 qemu syscall.c:361 的注释「sched_attr is not defined in glibc」是**前提假设错误**：
+#     该 struct 在 glibc 环境确无，但 Android/bionic 内核头 **linux/sched/types.h 已定义**
+#     （NDK r29 实测存在）。即「Android 内核头比 glibc 环境更新」，与 qemu 假设相反。
+#   证据2 该 struct 定义在 syscall.c:362-373，**无任何 #ifdef 门控**（无条件定义）→ 必冲突。
+#   证据3 ★逐字比对：qemu 自定版与 linux/sched/types.h 版 **10/10 字段名/顺序/宽度全一致**
+#     （uint32_t==__u32==unsigned int；int32_t==__s32）：
+#       size,sched_policy,sched_flags,sched_nice,sched_priority,
+#       sched_runtime,sched_deadline,sched_period,sched_util_min,sched_util_max
+#     sizeof == 56（= SCHED_ATTR_SIZE_VER1），本地 clang -S 实测确认 → **ABI 一致**。
+#   证据4 全树只有 syscall.c 定义该 struct（grep 唯一命中），其余都是引用：
+#       syscall.c:375/378（_syscall4/3 的 struct sched_attr * 形参）、
+#       syscall.c:11487/11519（局部变量 scha）、11508（offsetof(...,sched_util_min)）。
+#   方案抉择：**A2（#ifndef __BIONIC__ 包住 qemu 自定版）优于 A1（直接删）**：
+#     * A1（删）依赖「系统定义必存在」——若某 NDK 版本该头路径/宏变化，会直接编译失败，
+#       无兜底。A2 保留 qemu 自定版作为非 bionic 环境的回退，更稳健。
+#     * A2 与 A1 在 bionic 下**等价**（门控为假 → 用系统版；两版 ABI 一致 → 语义相同）。
+#     * A3（改名 sched_attr→qemu_sched_attr）会连带改 6 处引用且与系统版**并存**，
+#       徒增混淆，否决。
+#   ★ 是否影响 sched_getattr/sched_setattr 封装：否。
+#     门控只包 struct 定义；_syscall4(..., struct sched_attr *, ...) 与 11487+ 的用法
+#     在 __BIONIC__ 下解析到 linux/sched/types.h 的定义，字段同名同型 → 零影响（e2e 实测）。
+#
+# ── 问题 2：mqueue.h / mq_* 缺失 ───────────────────────────────────────────
+#   ../linux-user/syscall.c:1281:10: fatal error: 'mqueue.h' file not found
+#   证据1 顶层 mqueue.h 缺失：NDK sysroot `ls .../include/mqueue.h` → not found（实测）。
+#        （注：linux/mqueue.h **存在**，但它只是内核 UAPI，仅提供 struct mq_attr，
+#          不含 POSIX 的 mq_open/mq_unlink 声明。）
+#   证据2 全 sysroot 无任何 mq_open 等 libc 函数声明（grep 实测）；bionic libc.so
+#        符号表 `llvm-nm -D` 对 mq_* **零命中** → bionic 完全不提供 POSIX 消息队列 libc 层。
+#   证据3 host syscall 号齐全：asm-generic/unistd.h 有 __NR_mq_open=180 / mq_unlink=181 /
+#        mq_timedsend=182 / mq_timedreceive=183（仅缺 libc 封装与头）。
+#   证据4 门控结构（逐字核对）：mqueue 代码分**三块**，门控**不一致**：
+#     (a) syscall.c:771-780  safe_syscall5(mq_timedsend/timedreceive)
+#         门控 = `#if defined(TARGET_NR_mq_timedsend[_time64])` —— **不含 __NR_mq_***
+#     (b) syscall.c:1278-1318 `#include <mqueue.h>` + copy_{from,to}_user_mq_attr
+#         门控 = `#if defined(TARGET_NR_mq_open) && defined(__NR_mq_open)`
+#     (c) syscall.c:13015-13150 `case TARGET_NR_mq_*` 分支
+#         门控 = `#if defined(TARGET_NR_mq_open) && defined(__NR_mq_open)`
+#     ★ 关键：mq_timedsend/timedreceive 经 safe_syscall5 展开为 `syscall(__NR_mq_timedsend,...)`
+#       —— **纯原生 syscall，不需要 libc 实现**。故仅 (b)(c) 需要 mq_* libc 符号。
+#   证据5 (b) 块实际调用 libc mq_* 的**只有 2 个**：mq_open(13034) / mq_unlink(13044)。
+#       （mq_getsetattr/mq_notify 未在此块调用；mq_close 亦未调用。）
+#
+#   方案抉择：**B1（自备 mqueue.h shim + 实现 mq_open/mq_unlink）**。B2 已被**实测证伪**：
+#   ✗ B2（-D__NR_mq_open=0）**不可行** —— 本地实测 `clang -D__NR_mq_open=0 -dM -E` 显示
+#     最终值仍为 180：命令行 -D 发生在 <linux/unistd.h>（内含 asm-generic/unistd.h）**之前**，
+#     头文件的裸 `#define __NR_mq_open 180` 无条件覆盖命令行宏，且 `defined()` 恒真。
+#     → 门控永不熄灭。此外 B2 即便能熄灭 (b)(c)，也**漏掉 (a)**（(a) 只看 TARGET_NR_*），
+#     与 run#35 的「cdefs 裸 #define 覆盖命令行 -D」是同一类陷阱（step 3.5 已载明）。
+#   ✗ B3（改 syscall.c 加门控）会脏化 qemu 树、且门控条件需覆盖 3 处不一致的块，维护差；
+#     shim 路线对上游零侵入、可审计。
+#   ✓ B1 工作量评估（已收窄）：仅需 2 个函数实现，均用 host syscall 直拼：
+#       mq_open(name,flags,...)  → syscall(__NR_mq_open, name, flags&~O_CLOEXEC, mode, attr)
+#       mq_unlink(name)          → syscall(__NR_mq_unlink, name)
+#     细节：① O_CLOEXEC 不是 syscall 选项，须剥离（否则 EINVAL）；glibc 亦如此。
+#           ② O_CREAT 时才消费 mode+attr 两个可变参数（va_arg）。
+#           ③ name 须以 '/' 起头（POSIX mq 语义），qemu 侧 lock_user_string(arg1-1) 已处理。
+#           ④ 本地已实测：shim 头 + mq-shim.c 编译链接 PASS，16KB LOAD 对齐达标（0x4000）。
+#
+#   ★ 对 opencode 实际使用场景的影响评估：
+#     opencode 在安卓上跑 node CLI / git / ripgrep。POSIX 消息队列（mq_*）在 Linux 上
+#     依赖 /dev/mqueue 挂载 + mqueue 文件系统，**proot/容器环境通常未挂载**；
+#     node（libuv）、git、ripgrep **均不使用 POSIX 消息队列**（它们用 pipe/socket/eventfd）。
+#     grep node/git/ripgrep 源码：无 mq_open/mq_unlink 调用。
+#     → 即便 mq_* 在宿主返回 ENOSYS，对 opencode 场景**零影响**。但按项目铁律
+#       「不静默破坏兼容性」，仍选 B1（保持 guest mq_* 语义完整，宿主真支持时可用）。
+#
+# 注入方式：**用 -I 目录**（步 4 的 --extra-cflags 追加 -I$MQ_SHIM_DIR），**不用 -include**：
+#   * -include 是 driver 级 flag，会波及 .S 汇编（run#37 的教训，step 3.6 已载）；
+#   * -I 仅影响 include 搜索路径，.S 不 include <mqueue.h> → 天然免疫（本地实测确认）；
+#   * shim 头仍加 __ASSEMBLER__ 守卫作为**双保险**（防未来 -include 注入）。
+# 幂等：源码补丁用 awk 重写（先探门控存在性再决定），shim 用 cat > 覆盖写，重跑安全。
+log "step 3.7/5 — 修补 bionic sched_attr 重复定义 + mqueue.h 缺失（Android 平台特有）"
+
+# ── 3.7a 源码补丁：sched_attr 加 __BIONIC__ 门控 ──
+SC="$QEMU_DIR/linux-user/syscall.c"
+[[ -f "$SC" ]] || die "qemu 源码结构漂移：缺 linux-user/syscall.c"
+# 前置断言：qemu 自定版 struct sched_attr 确存在（防 qemu 版本漂移后补丁空转/错位）
+awk '/^struct sched_attr \{/{f=1} END{exit !f}' "$SC" \
+  || die "syscall.c 内未见自定 struct sched_attr：qemu 版本漂移，请复核 QEMU_REF"
+# 前置断言：该定义当前**无** __BIONIC__ 门控（防上游已修复 → 重复包一层）
+# 【加固】判据不能用裸 `#ifndef __BIONIC__`：若 qemu 未来在 syscall.c 别处引入
+#   任何 __BIONIC__ 门控，裸判据会误判「已打补丁」而静默跳过，或让 L706 的
+#   「恰为 1」断言误 die。故锚定到【本补丁独有的标记串】（含中文注释特征）。
+if awk '/^#ifndef __BIONIC__   \/\* bionic: linux\/sched\/types\.h/{f=1} END{exit !f}' "$SC"; then
+  log "  sched_attr 已带 __BIONIC__ 门控（前次已打补丁，幂等跳过）"
+else
+  # 幂等：awk 重写，仅在「注释行前插 #ifndef / 紧邻的 } 后插 #endif」。
+  #   （BSD sed 的 range+append 跨平台不可靠，故用 awk；输出落临时文件再原子替换。）
+  awk '
+    /^\/\* sched_attr is not defined in glibc \*\/$/ {
+      print "#ifndef __BIONIC__   /* bionic: linux/sched/types.h 已定义，防重复定义 */"
+      print; inguard=1; next
+    }
+    inguard && /^};$/ { print; print "#endif /* !__BIONIC__ */"; inguard=0; next }
+    { print }
+  ' "$SC" > "$SC.qemu-tmp" && mv "$SC.qemu-tmp" "$SC" \
+    || die "sched_attr 门控补丁失败（awk 重写）"
+  # 收尾断言：门控确实落地（awk 全量消费 + exit 码，禁用 | grep -q）
+  #   同样锚定本补丁独有标记串，避免与未来上游 __BIONIC__ 误配。
+  awk '/^#ifndef __BIONIC__   \/\* bionic: linux\/sched\/types\.h/{f=1} END{exit !f}' "$SC" \
+    || die "补丁后 syscall.c 仍未见 __BIONIC__ 门控（静默失效）"
+  awk '/^#endif \/\* !__BIONIC__ \*\/$/{f=1} END{exit !f}' "$SC" \
+    || die "补丁后 syscall.c 缺少配套 #endif（括号不配对）"
+  log "  sched_attr 已加 __BIONIC__ 门控（bionic 下改用 linux/sched/types.h 定义，ABI 逐字一致）"
+fi
+# 正向断言：本补丁的门控标记恰为 1（防重复插入破坏；锚定独有标记串，不误配上游）
+_N_BIONIC_GUARD="$(grep -c '^#ifndef __BIONIC__   /\* bionic: linux/sched/types\.h' "$SC" || true)"
+[[ "$_N_BIONIC_GUARD" == 1 ]] \
+  || die "sched_attr 门控出现 $_N_BIONIC_GUARD 次（应为 1，补丁非幂等或错位）"
+
+# ── 3.7b mqueue.h shim（-I 目录注入；仅需 mq_open/mq_unlink/mq_close 实现）──
+MQ_SHIM_DIR="$STAGING/bionic-shim-include"
+mkdir -p "$MQ_SHIM_DIR"
+# 前置断言：bionic 确实缺顶层 mqueue.h（防新版 NDK 已提供 → 遮蔽上游头）
+[[ ! -f "$TOOLCHAIN/sysroot/usr/include/mqueue.h" ]] \
+  || die "bionic 已提供 mqueue.h（NDK 更新）：shim 会遮蔽上游头，请复核 NDK 版本"
+# 前置断言：qemu 侧确在 syscall.c 引用 mqueue.h（防 qemu 版本漂移后 shim 空转）
+awk '/#include <mqueue.h>/{f=1} END{exit !f}' "$SC" \
+  || die "syscall.c 内未见 #include <mqueue.h>：qemu 结构漂移，请复核 QEMU_REF"
+
+# 幂等生成 shim 头（cat > 覆盖写）
+cat > "$MQ_SHIM_DIR/mqueue.h" <<'MQSHIM_EOF'
+/* mqueue.h — bionic POSIX 消息队列缺失头的补丁 shim（经 -I 目录注入）
+ *
+ * 【存在性证据】bionic 无顶层 <mqueue.h>；bionic libc 不导出任何 mq_* 符号
+ *   （llvm-nm -D 对 mq_* 零命中）；仅内核 UAPI <linux/mqueue.h> 提供 struct mq_attr。
+ *   故本 shim 提供：struct mq_attr（转引 UAPI）+ mqd_t + 7 个 POSIX 原型声明。
+ *
+ * 【__ASSEMBLER__ 守卫】双保险：本头经 -I 注入（.S 不 include <mqueue.h>，天然免疫），
+ *   但保留守卫以防未来改用 -include（run#37 的 .S 教训，见 step 3.6）。
+ */
+#ifndef QEMU_BIONIC_MQUEUE_SHIM_H
+#define QEMU_BIONIC_MQUEUE_SHIM_H
+
+#ifndef __ASSEMBLER__
+
+#include <linux/mqueue.h>   /* UAPI: struct mq_attr（含 __reserved[4]） */
+#include <sys/cdefs.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <time.h>
+
+/* POSIX: mqd_t 为 int；bionic 无此 typedef */
+#ifndef __mqd_t_defined
+typedef int mqd_t;
+#define __mqd_t_defined 1
+#endif
+
+struct sigevent;            /* 仅需前向声明（mq_notify 形参） */
+
+__BEGIN_DECLS
+
+extern mqd_t mq_open(const char *__name, int __flags, ...);
+extern int mq_close(mqd_t __mqdes);
+extern int mq_unlink(const char *__name);
+extern int mq_timedsend(mqd_t __mqdes, const char *__msg_ptr,
+                        size_t __msg_len, unsigned int __msg_prio,
+                        const struct timespec *__abs_timeout);
+extern ssize_t mq_timedreceive(mqd_t __mqdes, char *__msg_ptr,
+                               size_t __msg_len, unsigned int *__msg_prio,
+                               const struct timespec *__abs_timeout);
+extern int mq_getsetattr(mqd_t __mqdes, const struct mq_attr *__newattr,
+                         struct mq_attr *__oldattr);
+extern int mq_notify(mqd_t __mqdes, const struct sigevent *__notification);
+
+__END_DECLS
+
+#endif /* !__ASSEMBLER__ */
+#endif /* QEMU_BIONIC_MQUEUE_SHIM_H */
+MQSHIM_EOF
+[[ -s "$MQ_SHIM_DIR/mqueue.h" ]] || die "mqueue.h shim 生成失败: $MQ_SHIM_DIR/mqueue.h"
+log "  [shim] 已生成 $MQ_SHIM_DIR/mqueue.h（$(wc -c < "$MQ_SHIM_DIR/mqueue.h") 字节）"
+
+# ── 3.7c mq_* 实现（mq_open/mq_unlink/mq_close），编译为静态库供链接期使用 ──
+MQ_SHIM_SRC="$STAGING/mq-shim.c"
+MQ_SHIM_LIB="$STAGING/lib/libqemu-mqshim.a"
+cat > "$MQ_SHIM_SRC" <<'MQIMPL_EOF'
+/* mq-shim.c — bionic 缺失的 mq_* libc 层最小实现（仅供 qemu linux-user 使用）
+ * qemu 实际调用面（syscall.c 实测）：仅 mq_open / mq_unlink；
+ * mq_timedsend/mq_timedreceive 走 qemu 原生 safe_syscall（不经 libc）→ 无需实现。
+ * mq_close 兜底提供（= close(fd)）。 */
+#include <stdarg.h>
+#include <fcntl.h>
+#include <unistd.h>          /* syscall() 原型 + __NR_close */
+#include <sys/syscall.h>
+#include <linux/mqueue.h>
+
+typedef int mqd_t;
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 02000000
+#endif
+
+/* POSIX mq_open(name, oflag, ...)：仅 O_CREAT 时传 mode 与 attr。
+ * O_CLOEXEC 非 syscall 选项，须剥离（否则内核 EINVAL），与 glibc 行为一致。 */
+mqd_t mq_open(const char *name, int oflag, ...)
+{
+    mode_t mode = 0;
+    struct mq_attr *attr = 0;
+    va_list ap;
+    int flags = oflag;
+
+    if (oflag & O_CREAT) {
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        attr = va_arg(ap, struct mq_attr *);
+        va_end(ap);
+    }
+    flags &= ~O_CLOEXEC;
+    return (mqd_t)syscall(__NR_mq_open, name, flags, (int)mode, attr);
+}
+
+int mq_unlink(const char *name)
+{
+    return (int)syscall(__NR_mq_unlink, name);
+}
+
+int mq_close(mqd_t mqdes)
+{
+    return (int)syscall(__NR_close, (int)mqdes);
+}
+MQIMPL_EOF
+[[ -s "$MQ_SHIM_SRC" ]] || die "mq-shim.c 生成失败: $MQ_SHIM_SRC"
+
+# 编译 mq-shim.c（静态，对齐 flag 一并施加）。用 -I 注入 shim 头。
+#   $CC = aarch64-linux-android26-clang wrapper，已内置 --target/--sysroot/API，
+#   故不再重复传 target/sysroot（避免与 wrapper 默认冲突）。
+mkdir -p "$STAGING/lib"
+"$CC" -fPIC -O2 \
+  -I"$MQ_SHIM_DIR" \
+  -c "$MQ_SHIM_SRC" -o "$STAGING/lib/mq-shim.o" \
+  || die "mq-shim.c 编译失败（检查 __NR_mq_open/__NR_mq_unlink 是否在 host unistd.h）"
+"$AR" rcs "$MQ_SHIM_LIB" "$STAGING/lib/mq-shim.o" \
+  || die "mq-shim 归档失败: $MQ_SHIM_LIB"
+# 正向断言：库内确有 mq_open/mq_unlink 符号（防静默空库）
+"$NM" "$MQ_SHIM_LIB" 2>/dev/null | awk '/ T mq_open$/{o=1} / T mq_unlink$/{u=1} END{exit !(o&&u)}' \
+  || die "libqemu-mqshim.a 内未见 mq_open/mq_unlink 符号（编译/归档静默失败）"
+log "  [impl] 已生成 $MQ_SHIM_LIB（含 mq_open/mq_unlink/mq_close）"
+
 # ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
 # 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
 #   ERROR: unknown option --cross-file
@@ -617,7 +864,9 @@ log "  [shim] 已生成 $SHIM_HEADER（$(wc -c < "$SHIM_HEADER") 字节）"
 log "step 4/5 — qemu configure (交叉模式 via --cross-prefix=, --static, aarch64-linux-user) 与 ninja 编译"
 
 # 4a. 投送参数：qemu 生成的 cross file 从 CFLAGS/LDFLAGS 取值（见上方 (b)）
-QEMU_CFLAGS="-O2 -I$STAGING/include"
+# 【run#38 新增】-I$MQ_SHIM_DIR：注入 step 3.7b 的 mqueue.h shim（仅影响 include 搜索
+#   路径，.S 不 include <mqueue.h> → 不波及汇编，区别于 step 3.6 的 -include）。
+QEMU_CFLAGS="-O2 -I$STAGING/include -I$MQ_SHIM_DIR"
 QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
 
 (
@@ -738,7 +987,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
     --disable-capstone --disable-gnutls --disable-gcrypt --disable-nettle \
     --disable-seccomp --disable-curl --disable-libssh --disable-slirp \
     --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe -Wno-error=deprecated-declarations -Wno-error=constant-conversion -include $SHIM_HEADER" \
-    --extra-ldflags="$ALIGN_LDFLAG" \
+    --extra-ldflags="$ALIGN_LDFLAG -L$STAGING/lib -lqemu-mqshim" \
     --with-pkgversion="OpenCode-Android-$QEMU_REF" \
     || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
 
