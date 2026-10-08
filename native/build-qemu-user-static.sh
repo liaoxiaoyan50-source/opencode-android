@@ -238,6 +238,56 @@ if [[ ! -d "$QEMU_DIR" ]]; then
             https://github.com/qemu/qemu "$QEMU_DIR"
 fi
 
+# ══════════════════ 第 2.5 步：隐式声明防御补丁（预防性加固，未实锤） ════════
+# 预防性（qemu 编译错误尚未实锤）：NDK r29 / clang 19 把 C99+ 模式下的隐式
+# 函数声明升级为默认硬错误——proot 侧已在 CI run#10 实锤（完整根因注释见
+# build-proot.sh「CI run#10 根因修复」段，此处不赘述）。qemu v9.2 主树长期
+# 跑 clang、meson 构建自带严格检查，主树命中概率低；但树内 submodule/独立
+# 代码不可控，预防成本远低于一轮 CI 失败往返，故预埋同款 include 补齐扫描。
+# 与 build-proot.sh 同模式（grep -E 用法扫描 + 显式 include 缺失判定 + sed
+# 插入，string.h 族 / stdio.h 族两套），差异仅在插入位置——qemu 编码规范
+# 要求每个 .c 的第一个 #include 必须是 "qemu/osdep.h"，因此：
+#   * 文件含 osdep.h 行 → include 插到该行【之后】（不破"osdep.h 第一"规范；
+#     osdep.h 之后接系统头本就是 qemu 常规写法；重复包含由头文件 guard 兜底）；
+#   * 文件不含 osdep.h（submodule/独立代码）→ 插第 1 行。
+# 幂等：已显式包含对应头文件的跳过；KEEP_BUILD=1 重跑安全。
+log "step 2.5/5 — 隐式声明防御补丁（预防性加固，qemu 侧未实锤）"
+_QEMU_PATCH_COUNT=0
+while IFS= read -r -d '' f; do
+  if grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*"qemu/osdep\.h"' "$f"; then
+    _ANCHOR_ODEP=1   # osdep.h 在手：include 插其行后
+  else
+    _ANCHOR_ODEP=0   # 无 osdep.h（submodule/独立代码）：插第 1 行
+  fi
+  # —— string.h 族 ——
+  if grep -Eq '(^|[^A-Za-z0-9_])(strcmp|strncmp|strcpy|strncpy|strcat|strncat|strlen|strnlen|strchr|strrchr|strstr|strdup|strndup|strspn|strcspn|strpbrk|strtok|strtok_r|strerror|strerror_r|strcasecmp|strncasecmp|strsignal|memset|memcpy|memmove|memcmp|memchr|memmem)[[:space:]]*\(' "$f" \
+     && ! grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"]string\.h[>"]' "$f"; then
+    if [[ "$_ANCHOR_ODEP" == 1 ]]; then
+      sed -i.bak '/qemu\/osdep\.h/a\
+#include <string.h>' "$f" || die "隐式声明补丁失败: $f"
+    else
+      sed -i.bak '1i\
+#include <string.h>' "$f" || die "隐式声明补丁失败: $f"
+    fi
+    rm -f "$f.bak"
+    _QEMU_PATCH_COUNT=$((_QEMU_PATCH_COUNT + 1))
+  fi
+  # —— stdio.h 族（snprintf 声明在 stdio.h 而非 string.h，单独判定）——
+  if grep -Eq '(^|[^A-Za-z0-9_])(snprintf|sprintf|sscanf|vsnprintf|fprintf|printf|puts|fputs)[[:space:]]*\(' "$f" \
+     && ! grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"]stdio\.h[>"]' "$f"; then
+    if [[ "$_ANCHOR_ODEP" == 1 ]]; then
+      sed -i.bak '/qemu\/osdep\.h/a\
+#include <stdio.h>' "$f" || die "隐式声明补丁失败: $f"
+    else
+      sed -i.bak '1i\
+#include <stdio.h>' "$f" || die "隐式声明补丁失败: $f"
+    fi
+    rm -f "$f.bak"
+    _QEMU_PATCH_COUNT=$((_QEMU_PATCH_COUNT + 1))
+  fi
+done < <(find "$QEMU_DIR" -type f -name '*.c' -print0)
+log "  [patch] qemu 侧共插入 $_QEMU_PATCH_COUNT 处 include"
+
 # ══════════════════ 第 3 步：TARGET_PAGE_BITS_VARY 源码断言（D7 硬性要求） ══
 log "step 3/5 — 断言 TARGET_PAGE_BITS_VARY（aarch64 linux-user 内置页位宽可变）"
 CPU_PARAM="$QEMU_DIR/target/arm/cpu-param.h"
@@ -291,8 +341,7 @@ QEMU_BIN="$QEMU_DIR/build/qemu-aarch64"
   || die "架构断言失败：产物不是 AArch64"
 
 # (b) C3 静态断言：NEEDED 必须为 0
-readelf_dyn() { "$READELF" -d "$1" 2>/dev/null || true; }
-NEEDED="$(readelf_dyn "$QEMU_BIN" | awk '/NEEDED/{print}')"
+NEEDED="$('$READELF' -d '$QEMU_BIN' 2>/dev/null | awk '/NEEDED/{print}' || true)"
 if [[ -n "$NEEDED" ]]; then
   die "静态断言失败：产物存在动态 .so 依赖（违反 C3 --static）：
 $NEEDED"
