@@ -413,6 +413,32 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
   # 4b. 工具链全量显式（因 cross_prefix 为空，不做任何名称拼接）
   #     依据 (a)：CC/CXX/AR/NM/STRIP/RANLIB/LD/OBJCOPY/READELF/PKG_CONFIG
   #     均可经环境变量覆盖，空 prefix 不会拼出错误的 *-gcc / *-ld。
+  #
+  # 【run#33 根因修复】新增 -Wno-error=default-const-init-field-unsafe 到 extra-cflags。
+  #   现象：../tcg/perf.c:252:24: error: default initialization of an object of type
+  #     'struct debug_entry' with const member leaves the object uninitialized
+  #     [-Werror,-Wdefault-const-init-field-unsafe]
+  #   根因（已核源码 qemu-9.2.0/tcg/perf.c）：
+  #     * perf.c L154-159 的 struct debug_entry 末成员 `const char name[];` 是
+  #       柔性数组成员（FAM），合法 C；L252 `struct debug_entry ent;` 仅取
+  #       sizeof(ent)（L256/L262）参与 jitdump 记录长度计算，从不读 ent.name。
+  #       → 标准 C 惯用法，clang 新诊断对此误报，非上游 bug、无实害。
+  #     * 该诊断是 clang 19+ 新增；CI runner 实为 clang 21.0.0，NDK 30.0.16248370，
+  #       被 qemu 自带 -Werror（meson warning level 注入，非本脚本所加）提升为硬错误。
+  #     * 【非 bionic 特有】属「上游 qemu + 新版 clang -Werror」通用兼容问题。
+  #
+  #   修法裁决：用 -Wno-error=...（只降级不关闭），而非 -Wno-...（全关）。
+  #     理由：① 仅降级可使告警文字仍留在日志（CI 可检索），真问题不被静默掩盖；
+  #           ② 语义精准到单条诊断，不扩大到 qemu 全树；③ 该 flag 追加在 c_args
+  #           末尾（c_args = $CFLAGS + $EXTRA_CFLAGS，见 (b)），必然位于 -Werror
+  #           之后，按 clang「后者覆盖前者」规则成功降级。
+  #     为何经 --extra-cflags 而非 CFLAGS：CFLAGS（4a 的 QEMU_CFLAGS）承载
+  #       -I$STAGING/include 等探测必需项，代表通用环境；--extra-cflags 是 qemu
+  #       为项目级额外 flag 预留的语义入口，归位更正且不动 4a 稳定定义。
+  #       （两条最终都进 meson c_args，位置等价，故按语义择用。）
+  #
+  #   【刻意只修这一处】不透支性加一批 -Wno-*：一次性堆 flag 会掩盖后续真问题、
+  #     且掩盖「哪些是新诊断」的事实。让 CI 逐轮暴露下一处，保持修复可审计。
   env \
     CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" STRIP="$STRIP" RANLIB="$RANLIB" \
     LD="$TOOLCHAIN/bin/ld.lld" \
@@ -434,7 +460,7 @@ QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
     --disable-docs --disable-tools --disable-guest-agent \
     --disable-capstone --disable-gnutls --disable-gcrypt --disable-nettle \
     --disable-seccomp --disable-curl --disable-libssh --disable-slirp \
-    --extra-cflags="-O2" \
+    --extra-cflags="-O2 -Wno-error=default-const-init-field-unsafe" \
     --extra-ldflags="$ALIGN_LDFLAG" \
     --with-pkgversion="OpenCode-Android-$QEMU_REF" \
     || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
