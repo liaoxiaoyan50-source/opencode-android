@@ -378,21 +378,54 @@ printf '%s\n' "$USER_BLOCK" \
 log "断言通过，cpu-param.h 相关定义："
 printf '%s\n' "$USER_BLOCK" | grep -E 'TARGET_PAGE_BITS|TARGET_AARCH64' | sed 's/^/    /'
 
-# ══════════════════ 第 4 步：meson configure + 编译（--static） ═════════════
-log "step 4/5 — qemu configure (--static, aarch64-linux-user) 与 ninja 编译"
+# ══════════════════ 第 4 步：qemu configure + ninja 编译（--static） ═══════════
+# 【run#31 根因修复】原调用传了 --cross-file "$CROSS_FILE" → qemu configure 直接报
+#   ERROR: unknown option --cross-file
+# 根因：--cross-file 不是 qemu configure 的选项，qemu 有 **自己的 cross file 生成器**。
+# 逐字依据（qemu v9.2.0 root/configure，已核对）：
+#   (a) cross_compile 的唯一置位点是参数解析：
+#         --cross-prefix=*) cross_prefix="$optarg"; cross_compile="yes" ;;
+#       --help 明文：use PREFIX for compile tools, PREFIX can be blank
+#       —— 即传「空串」--cross-prefix= 即可点亮交叉模式（本地 sh 实测：
+#          case '--cross-prefix=*' 命中空串，optarg=""，cross_compile=yes）。
+#       注意：--cross-prefix=aarch64-linux-android26- 是【错误替代】—— 会让
+#           as/ld/nm/ar/ranlib/strip/objcopy 全部按 ${cross_prefix}<tool> 拼接，
+#           拼出不存在的 aarch64-linux-android26-ld 等；工具名必须走环境变量。
+#   (b) qemu 自行生成 config-meson.cross，其内容来源：
+#         c_args      = $CFLAGS + $EXTRA_CFLAGS
+#         c_link_args = $CFLAGS + $LDFLAGS + $EXTRA_CFLAGS + $EXTRA_LDFLAGS
+#       故 include/lib/对齐 flag 必须经 CFLAGS/LDFLAGS（或 --extra-*）送入。
+#   (c) 仅 cross_compile=yes 时才写 [host_machine] 并加 --cross-file config-meson.cross。
+#   (d) 不存在的选项（如 --llvm）会走 --*) meson_option_parse 兜底报 unknown option。
+#   (e) linux-user 产物名 = 'qemu-' + TARGET_NAME = qemu-aarch64（非 softmmu 无
+#       system- 前缀），落 build/qemu-aarch64 —— step 5 路径无需改。
+# 保留 $CROSS_FILE 的生成（step 1d 的 glib 仍在使用它）。
+log "step 4/5 — qemu configure (交叉模式 via --cross-prefix=, --static, aarch64-linux-user) 与 ninja 编译"
+
+# 4a. 投送参数：qemu 生成的 cross file 从 CFLAGS/LDFLAGS 取值（见上方 (b)）
+QEMU_CFLAGS="-O2 -I$STAGING/include"
+QEMU_LDFLAGS="-L$STAGING/lib $ALIGN_LDFLAG"
+
 (
   cd "$QEMU_DIR"
   rm -rf build
-  # 参数说明：
-  #   --static ......................... C3 强制静态
-  #   --target-list=aarch64-linux-user . 仅 aarch64 guest（C3）
-  #   --without-default-features ....... 关闭全部可选依赖（glib 除外，为硬依赖）
-  #   --enable-tcg ..................... TCG 是 qemu-user 执行后端，显式开启防
-  #                                      without-default-features 连带关闭
-  #   --extra-cflags=-O2 ............... meson buildtype 默认非优化，显式开 O2
-  #   --with-pkgversion ................ 版本标识，便于设备端诊断报告归因
+
+  # 4b. 工具链全量显式（因 cross_prefix 为空，不做任何名称拼接）
+  #     依据 (a)：CC/CXX/AR/NM/STRIP/RANLIB/LD/OBJCOPY/READELF/PKG_CONFIG
+  #     均可经环境变量覆盖，空 prefix 不会拼出错误的 *-gcc / *-ld。
+  env \
+    CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" STRIP="$STRIP" RANLIB="$RANLIB" \
+    LD="$TOOLCHAIN/bin/ld.lld" \
+    OBJCOPY="$TOOLCHAIN/bin/llvm-objcopy" \
+    READELF="$READELF" \
+    PKG_CONFIG="$PKGCFG_WRAPPER" \
+    PKG_CONFIG_LIBDIR="$STAGING/lib/pkgconfig" \
+    PKG_CONFIG_PATH="" \
+    CFLAGS="$QEMU_CFLAGS" \
+    LDFLAGS="$QEMU_LDFLAGS" \
+    PATH="$TOOLCHAIN/bin:$PATH" \
   ./configure \
-    --cross-file "$CROSS_FILE" \
+    --cross-prefix= \
     --static \
     --target-list=aarch64-linux-user \
     --without-default-features \
@@ -402,8 +435,23 @@ log "step 4/5 — qemu configure (--static, aarch64-linux-user) 与 ninja 编译
     --disable-capstone --disable-gnutls --disable-gcrypt --disable-nettle \
     --disable-seccomp --disable-curl --disable-libssh --disable-slirp \
     --extra-cflags="-O2" \
-    --with-pkgversion="OpenCode-Android-$QEMU_REF"
-  ninja -C build -j"$JOBS" qemu-aarch64
+    --extra-ldflags="$ALIGN_LDFLAG" \
+    --with-pkgversion="OpenCode-Android-$QEMU_REF" \
+    || die "qemu configure 失败（交叉模式未生效或依赖未找到，见上方日志）"
+
+  # 4c. configure 后置断言：交叉模式确实生效（防静默错配回归，依据 (c) (d)）
+  [[ -f config-meson.cross ]] \
+    || die "未生成 config-meson.cross：configure 未进入 meson 阶段（检查是否误加 --skip-meson）"
+  grep -q '^\[host_machine\]' config-meson.cross \
+    || die "config-meson.cross 缺 [host_machine]：cross_compile 未置位，--cross-prefix= 未生效"
+  grep -q "cpu = 'aarch64'" config-meson.cross \
+    || die "config-meson.cross 的 host cpu 非 aarch64：NDK clang target 异常（__aarch64__ 探针失败）"
+  log "交叉模式已生效，config-meson.cross [host_machine]："
+  sed -n '/^\[host_machine\]/,/^$/p' config-meson.cross | sed 's/^/    /'
+
+  # 4d. 编译（依据 (e)：目标名 = qemu-aarch64，产物 build/qemu-aarch64）
+  ninja -C build -j"$JOBS" qemu-aarch64 \
+    || die "ninja qemu-aarch64 失败（若为 undefined reference，查缺失库，勿改用 tcg-interpreter）"
 )
 
 # ══════════════════ 第 5 步：交付自检 + jniLibs 落地 ═════════════════════════
