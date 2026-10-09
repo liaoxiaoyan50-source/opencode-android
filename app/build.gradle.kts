@@ -180,6 +180,9 @@ dependencies {
     // 无需真机即可回归。kotlin-test 提供断言, kotlinx-coroutines-test 提供 runTest。
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // [PR10] lite 下载测试用 MockWebServer。注意: Android 单测编译环境不含
+    // com.sun.net.httpserver(JDK 内置但不在 Android 编译类路径), 故不能用它起本地服务。
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 
     // ⚠ 依赖红线（P4 §6-2）: 不引 androidx.navigation:navigation-compose 与
     //   androidx.security:security-crypto —— UI 层已自实现等价能力，引入反而增依赖面。
