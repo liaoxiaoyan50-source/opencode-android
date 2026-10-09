@@ -35,6 +35,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /** REST 调用结果; Err.code==401 表示凭据过期(引擎重启密码轮换, 见 P4 文档 §2.2) */
@@ -255,12 +256,33 @@ object SseQuota {
         }
     }
 
-    fun release() = used.updateAndGet { (it - 1).coerceAtLeast(0) }
+    // 下界 0 防重复释放变负; 上界 MAX 防「重复释放」把名额加到上限之上而使 ≤2 约束失效。
+    // 幂等的唯一保证在 SseSubscription 的 CAS 标志位, 这里是纵深防御。
+    fun release() = used.updateAndGet { (it - 1).coerceIn(0, MAX_SUBSCRIBERS) }
+
+    /** 当前已用名额(诊断用: 排查 QUOTA_DENIED 时观察是否泄漏) */
+    fun inUse(): Int = used.get()
 }
 
-/** 订阅句柄: cancel() 停止重连循环并释放全局配额 */
+/**
+ * 订阅句柄: cancel() 停止重连循环。**配额归还不在此处理** ——
+ * 名额由 [SseConnection.run] 的 finally 单点释放(P0-2 修复)。
+ *
+ * 之所以不让 cancel() 释放: 协程可能尚未真正结束(run() 未跑到 finally),
+ * cancel() 释放 + run() 释放 = 双释放, 会破坏「同一时刻 ≤2 订阅」契约(P2-2)。
+ * cancel() 本身以 CAS 保证幂等。
+ */
 class SseSubscription internal constructor(private val job: Job?, private val teardown: () -> Unit) {
-    fun cancel() { job?.cancel(); teardown() }
+    private val cancelClosed = AtomicBoolean(false)
+
+    /** 是否已 cancel(诊断用) */
+    fun isCancelled(): Boolean = cancelClosed.get()
+
+    fun cancel() {
+        if (!cancelClosed.compareAndSet(false, true)) return // 幂等
+        job?.cancel()
+        teardown()
+    }
 }
 
 // ─────────────────────────── EngineClient 主体 ───────────────────────────
@@ -431,6 +453,7 @@ class EngineClient(
         }
         val conn = SseConnection(sseHttp, baseUrl, onEvent, onState, onResync)
         val job = scope.launch(Dispatchers.IO) { conn.run() }
+        // 配额归还由 SseConnection.run() 的 finally 单点负责(P0-2); 此处只置 closed 让循环退出
         return SseSubscription(job) { conn.closed = true }
     }
 
@@ -452,24 +475,37 @@ internal class SseConnection(
     private val onResync: suspend () -> Unit,
 ) {
     @Volatile var closed = false
+
+    /** run() 已退出。配额释放以 finally 为单点(见 run), 此标志仅供诊断 */
+    @Volatile var finished = false
+        private set
+
     private var backoffMs = BACKOFF_MIN_MS
 
     suspend fun run() {
-        onState(SseState.CONNECTING)
-        while (currentCoroutineContext().isActive && !closed) {
-            try {
-                connectAndPump() // 正常返回 = 服务端关流, 同样按断线处理
-            } catch (e: Exception) {
+        try {
+            onState(SseState.CONNECTING)
+            while (currentCoroutineContext().isActive && !closed) {
+                try {
+                    connectAndPump() // 正常返回 = 服务端关流, 同样按断线处理
+                } catch (e: Exception) {
+                    if (closed) break
+                    Log.i(TAG, "SSE 连接异常: ${e.message}") // 仅状态与 baseUrl, 无凭据(P1 §3.4)
+                }
                 if (closed) break
-                Log.i(TAG, "SSE 连接异常: ${e.message}") // 仅状态与 baseUrl, 无凭据(P1 §3.4)
+                onState(SseState.RETRYING)
+                Log.i(TAG, "SSE 断线, ${backoffMs}ms 后重连(指数退避 1s→30s, P1 §3.4)") // M2-4 观测点
+                delay(backoffMs)
+                backoffMs = (backoffMs * 2).coerceAtMost(BACKOFF_MAX_MS)
             }
-            if (closed) break
-            onState(SseState.RETRYING)
-            Log.i(TAG, "SSE 断线, ${backoffMs}ms 后重连(指数退避 1s→30s, P1 §3.4)") // M2-4 观测点
-            delay(backoffMs)
-            backoffMs = (backoffMs * 2).coerceAtMost(BACKOFF_MAX_MS)
+            onState(SseState.CLOSED)
+        } finally {
+            // [P0-2 修复核心] 配额归还单点。必须放 finally —— 实测协程在 delay() 处被
+            // cancel 时, finally 之后的普通语句不会执行, 只有 finally 路径必经。
+            // 此前无任何释放路径, 名额只增不减 → 数次引擎重启后 SSE 永久 QUOTA_DENIED。
+            finished = true
+            SseQuota.release()
         }
-        onState(SseState.CLOSED)
     }
 
     private suspend fun connectAndPump() {

@@ -106,6 +106,16 @@ class ChatController(private val scope: CoroutineScope) {
         activeSessionId.value?.let { id -> scope.launch { loadMessages(id) } }
     }
 
+    /**
+     * [P1-5] 生命周期终止解绑: 由 AppRoot 的 DisposableEffect 在组合离开时调用。
+     * 幂等 —— 重复调用安全。配额归还仍由 SseConnection.run 的 finally 负责(单点)。
+     */
+    fun dispose() {
+        sse?.cancel(); sse = null
+        client = null
+        currentClient.value = null
+    }
+
     private suspend fun resync() { // P1 §3.4: 重连成功后重建会话状态
         loadSessions()
         activeSessionId.value?.let { loadMessages(it) }
@@ -157,40 +167,80 @@ class ChatController(private val scope: CoroutineScope) {
     fun create(title: String) {
         val c = client ?: return
         scope.launch(Dispatchers.IO) {
-            c.createSession(title.ifBlank { "新会话" }) // POST /session(P1 §3.4)
+            val r = c.createSession(title.ifBlank { "新会话" }) // POST /session(P1 §3.4)
+            reportIfFailed("新建会话", r)
             loadSessions()
         }
     }
 
     fun rename(id: String, title: String) {
         val c = client ?: return
-        scope.launch(Dispatchers.IO) { c.renameSession(id, title); loadSessions() } // PATCH(P1 §3.4)
+        scope.launch(Dispatchers.IO) {
+            val r = c.renameSession(id, title) // PATCH(P1 §3.4)
+            reportIfFailed("重命名会话", r)
+            loadSessions()
+        }
     }
 
     fun delete(id: String) {
         val c = client ?: return
         scope.launch(Dispatchers.IO) {
-            c.deleteSession(id) // DELETE /session/:id(P1 §3.4)
+            val r = c.deleteSession(id) // DELETE /session/:id(P1 §3.4)
+            reportIfFailed("删除会话", r)
             if (activeSessionId.value == id) open(null)
             loadSessions()
         }
     }
 
-    /** 发送: prompt_async 不阻塞(P1 §3.4), 消息渲染等 SSE MessagePart 回流 upsert */
+    /** [P1-6 修复] 会话管理类请求不得吞掉失败 —— 静默失败让用户以为操作已生效 */
+    private fun reportIfFailed(action: String, r: ApiResult<*>) {
+        when (r) {
+            is ApiResult.Ok -> Unit
+            is ApiResult.Err -> errorBanner.value =
+                if (r.code == 401) "$action 失败: 凭据已过期(引擎可能已重启), 等待重连…"
+                else "$action 失败: HTTP ${r.code}"
+            is ApiResult.Network -> errorBanner.value = "$action 失败: 网络错误 ${r.message.take(120)}"
+        }
+    }
+
+    /**
+     * 发送: prompt_async 不阻塞(P1 §3.4), 消息渲染等 SSE MessagePart 回流 upsert。
+     * [P1-6 修复] 此前 ApiResult 被完全丢弃, 且输入框在 onClick 已清空 ——
+     * 请求失败(401 凭据过期 / 404 / 断网)时用户零提示, 表现为「以为发出去了其实没发」。
+     */
     fun send(text: String) {
         val id = activeSessionId.value ?: return
         val body = text.trim()
         if (body.isEmpty()) return
         sending.value = true
         scope.launch(Dispatchers.IO) {
-            client?.promptAsync(id, body)
+            val result = client?.promptAsync(id, body)
             sending.value = false
+            if (activeSessionId.value != id) return@launch // 用户已切会话, 结果无归属
+            when (result) {
+                null -> errorBanner.value = "发送失败: 引擎连接已断开, 请检查引擎状态"
+                is ApiResult.Ok -> Unit // 结果经 SSE 回流渲染
+                is ApiResult.Err -> errorBanner.value =
+                    if (result.code == 401) "发送失败: 凭据已过期(引擎可能已重启), 等待重连…"
+                    else "发送失败: HTTP ${result.code} ${result.message.take(120)}"
+                is ApiResult.Network -> errorBanner.value = "发送失败: 网络错误 ${result.message.take(120)}"
+            }
         }
     }
 
+    /** 中断当前 agent 运行; 失败同样提示(P1-6 同源) */
     fun abort() {
         val id = activeSessionId.value ?: return
-        scope.launch(Dispatchers.IO) { client?.abort(id) } // POST /session/:id/abort(P1 §3.4)
+        scope.launch(Dispatchers.IO) {
+            val result = client?.abort(id) // POST /session/:id/abort(P1 §3.4)
+            if (activeSessionId.value != id) return@launch
+            when (result) {
+                null -> errorBanner.value = "中断失败: 引擎连接已断开"
+                is ApiResult.Ok -> Unit
+                is ApiResult.Err -> errorBanner.value = "中断失败: HTTP ${result.code}"
+                is ApiResult.Network -> errorBanner.value = "中断失败: 网络错误 ${result.message.take(120)}"
+            }
+        }
     }
 
     /** 权限审批回执: POST /session/:id/permissions/:permissionID(P1 §3.4 / P3 §7.1) */
@@ -436,7 +486,9 @@ private fun NewSessionDialog(onDismiss: () -> Unit, onCreate: (String) -> Unit) 
 
 @Composable
 private fun RenameDialog(initial: String, onDismiss: () -> Unit, onRename: (String) -> Unit) {
-    var title by remember { mutableStateOf(initial) }
+    // [P2-1 修复] remember 必须带 key: 无 key 时只在首次组合捕获 initial,
+    // 对同一会话二次重命名会残留上次的输入。key(initial) 保证初值变化时重置。
+    var title by remember(initial) { mutableStateOf(initial) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("重命名会话") },

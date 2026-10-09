@@ -93,8 +93,12 @@ object KeyVault {
         return gen.generateKey()
     }
 
-    /** 加密: 每次随机 IV(GCM 语义要求), 输出版本前缀 + base64(iv|ct) */
-    fun seal(context: Context, plain: String): String {
+    /**
+     * 加密: 每次随机 IV(GCM 语义要求), 输出版本前缀 + base64(iv|ct)。
+     * [P3-1] 去掉未使用的 context 参数 —— 密钥来自 AndroidKeyStore(secretKey()),
+     * 密文由调用方 put() 落 prefs, seal 本身不需要上下文。
+     */
+    fun seal(plain: String): String {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
         val iv = cipher.iv
@@ -103,8 +107,8 @@ object KeyVault {
         return "1|${b64.encodeToString(iv)}|${b64.encodeToString(ct)}"
     }
 
-    /** 解密: 失败(密文损坏/密钥重置)返回 null, 调用方按未配置处理, 不抛明文相关异常 */
-    fun unseal(context: Context, sealed: String): String? = runCatching {
+    /** 解密: 失败(密文损坏/密钥重置)返回 null, 调用方按未配置处理, 不抛明文相关异常。[P3-1] 同上去掉 context */
+    fun unseal(sealed: String): String? = runCatching {
         val (v, ivB64, ctB64) = sealed.split('|')
         check(v == "1")
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -113,11 +117,11 @@ object KeyVault {
     }.getOrNull()
 
     fun put(context: Context, id: String, plain: String) {
-        prefs(context).edit().putString(id, seal(context, plain)).apply()
+        prefs(context).edit().putString(id, seal(plain)).apply()
     }
 
     fun get(context: Context, id: String): String? =
-        prefs(context).getString(id, null)?.let { unseal(context, it) }
+        prefs(context).getString(id, null)?.let { unseal(it) }
 
     fun remove(context: Context, id: String) = prefs(context).edit().remove(id).apply()
 

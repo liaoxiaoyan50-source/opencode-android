@@ -28,7 +28,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -95,6 +97,13 @@ fun AppRoot(app: AppController) {
     // None 配置变更/模式切换 → ChatController 取消旧订阅、以新凭据重建并全量重载
     LaunchedEffect(client) { chat.bind(client) }
 
+    // [P1-5 修复] 组合离开时(Activity 销毁/转屏/进程重建)显式解绑 ChatController。
+    // 此前只依赖 scope.cancel 的时序, 订阅句柄从未被显式 cancel。
+    // 配额归还由 SseConnection.run 的 finally 单点负责(P0-2), dispose 保证语义明确。
+    DisposableEffect(Unit) {
+        onDispose { chat.dispose() }
+    }
+
     BackHandler(enabled = nav != Nav.Sessions) { nav = Nav.Sessions }
 
     when (val n = nav) {
@@ -129,14 +138,27 @@ internal fun SimpleTopBar(title: String, onBack: (() -> Unit)?, actions: @Compos
     }
 }
 
-/** 极简主题: 终端工具定位, 默认浅色 + 可切换深色(跟随系统由 Compose dynamic 摘要省略) */
+/**
+ * 主题: 跟随系统浅色/深色。
+ * [P2-3 修复] 此前硬编码 lightColorScheme 从未构造 darkColorScheme —— 而 Manifest 声明
+ * configChanges 含 uiMode, 拦截了系统深色切换(不重建 Activity), 于是深色模式永远不生效。
+ * 现依据 isSystemInDarkTheme() 选择配色, 由 Compose recomposition 驱动(uiMode 变化仍会触发)。
+ */
 @Composable
 internal fun OpenCodeTheme(content: @Composable () -> Unit) {
+    val dark = isSystemInDarkTheme()
     MaterialTheme(
-        colorScheme = lightColorScheme(
-            primary = Color(0xFF2D5BFF),
-            errorContainer = Color(0xFFFFDAD6),
-        ),
+        colorScheme = if (dark) {
+            darkColorScheme(
+                primary = Color(0xFFB2C5FF),
+                errorContainer = Color(0xFF93000A),
+            )
+        } else {
+            lightColorScheme(
+                primary = Color(0xFF2D5BFF),
+                errorContainer = Color(0xFFFFDAD6),
+            )
+        },
         content = content,
     )
 }
