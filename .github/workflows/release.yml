@@ -331,6 +331,20 @@ jobs:
           echo "full:"; ls -l app/src/full/assets/snapshot/
           echo "lite:"; ls -l app/src/lite/assets/snapshot/
 
+      # [PR10] JVM 单测门禁。此前仓库有 12 个单测但 CI 从不执行 —— 改了被测试
+      # 覆盖的逻辑(SHA 校验/路径穿越/幂等/symlink 还原/lite 续传)也能全绿合入。
+      # 置于快照注入之后, 保证两变体 assets 就绪; 失败即阻断。
+      - name: "Unit tests (JVM)"
+        run: |
+          set -o pipefail
+          ./gradlew :app:testFullDebugUnitTest :app:testLiteDebugUnitTest --stacktrace 2>&1 | tee unit-test.log
+          RC=${PIPESTATUS[0]}
+          if [ "${RC}" -ne 0 ]; then
+            echo "::error::JVM 单测失败 (RC=${RC}): 见 unit-test.log"
+            exit 1
+          fi
+          echo "单测通过: testFullDebugUnitTest + testLiteDebugUnitTest"
+
       - name: Restore keystore & build signed APKs (full/lite)
         env:
           KEYSTORE_BASE64:  ${{ secrets.KEYSTORE_BASE64 }}
@@ -424,6 +438,7 @@ jobs:
             proot-build.log
             qemu-build.log
             compile-check.log
+            unit-test.log
             gradle-build.log
           if-no-files-found: ignore
           retention-days: 7
@@ -462,6 +477,7 @@ jobs:
             echo "  proot-build.log   → ${JOB_DIR}/${PFX}-proot-build.log (存在时)"
             echo "  qemu-build.log    → ${JOB_DIR}/${PFX}-qemu-build.log (存在时)"
             echo "  compile-check.log → ${JOB_DIR}/${PFX}-compile-check.log (存在时, PR3 新增)"
+            echo "  unit-test.log     → ${JOB_DIR}/${PFX}-unit-test.log (存在时, PR10 新增)"
             echo "  gradle-build.log  → ${JOB_DIR}/${PFX}-gradle-build.log (存在时)"
             echo ""
             echo "说明: 本分支永远只保留最近一次失败 job 的日志 (force 覆盖语义)。"
@@ -471,6 +487,7 @@ jobs:
           # 2) 拷贝本轮全部 tee 日志 (存在才拷; 与 Upload failure logs artifact 口径一致)
           if [ -f proot-build.log ];  then cp -f proot-build.log  "${LOGREPO}/${JOB_DIR}/${PFX}-proot-build.log";  fi
           if [ -f compile-check.log ]; then cp -f compile-check.log "${LOGREPO}/${JOB_DIR}/${PFX}-compile-check.log"; fi
+          if [ -f unit-test.log ];     then cp -f unit-test.log     "${LOGREPO}/${JOB_DIR}/${PFX}-unit-test.log";     fi
           if [ -f qemu-build.log ];   then cp -f qemu-build.log   "${LOGREPO}/${JOB_DIR}/${PFX}-qemu-build.log";   fi
           if [ -f gradle-build.log ]; then cp -f gradle-build.log "${LOGREPO}/${JOB_DIR}/${PFX}-gradle-build.log"; fi
 
