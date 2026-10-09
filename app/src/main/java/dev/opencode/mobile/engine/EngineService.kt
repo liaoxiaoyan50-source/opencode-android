@@ -309,16 +309,14 @@ class EngineService : Service() {
         //        P6 M3-2 验收项不可能通过。
         val bundled = readBundledManifest()
         // [P1 minAppVersion] 快照要求的最低 App 版本校验(P1 §3.1 / M3-6): 旧 App 不得
-        // 安装/下载不兼容的新快照, 直接阻断并引导升级。
-        if (bundled != null && bundled.minAppVersion.isNotBlank() &&
-            compareSemver(appVersionName(), bundled.minAppVersion) < 0) {
+        // 安装/下载不兼容的新快照, 直接阻断并引导升级。判定抽到 EngineLogic(可纯测)。
+        if (bundled != null && isBlockedByMinAppVersion(appVersionName(), bundled)) {
             return fail("需升级 App",
                 "快照(oc ${bundled.ocVersion})要求 App ≥ ${bundled.minAppVersion}, " +
                     "当前 App ${appVersionName()}。请升级 App 后再启动本地引擎(P1 §3.1)。")
         }
         val installed = installer.installedVersion()
-        val needsInstall = installed == null ||
-            (bundled != null && bundled.snapshotVersion != installed)
+        val needsInstall = needsSnapshotInstall(installed, bundled)
         if (needsInstall) {
             if (installed != null && bundled != null) {
                 appendEngineNote(

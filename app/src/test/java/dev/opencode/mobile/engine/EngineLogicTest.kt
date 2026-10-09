@@ -9,7 +9,9 @@ package dev.opencode.mobile.engine
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class EngineLogicTest {
 
@@ -73,5 +75,29 @@ class EngineLogicTest {
     @Test
     fun `selfheal returns null on benign output`() {
         assertNull(SelfHeal.match("opencode serve listening on 127.0.0.1:4096\nhealthy"))
+    }
+
+    // ── bootSequence 决策函数 ───────────────────────────────────────
+
+    @Test
+    fun `needsSnapshotInstall logic`() {
+        val m = SnapshotManifest("20261010-oc1.19.0", "1.19.0", "x", 1L)
+        assertTrue(needsSnapshotInstall(null, m), "未安装 → 需安装")
+        assertTrue(needsSnapshotInstall("20261009-oc1.18.34", m), "版本不同 → 需安装(P0-4)")
+        assertFalse(needsSnapshotInstall("20261010-oc1.19.0", m), "同版本 → 不重装")
+        assertFalse(needsSnapshotInstall("20261010-oc1.19.0", null), "已装且无 bundled → 不重装")
+        assertTrue(needsSnapshotInstall(null, null), "未装无 bundled → true(后续 fail 无可用快照)")
+    }
+
+    @Test
+    fun `isBlockedByMinAppVersion logic`() {
+        val blocking = SnapshotManifest("v", "oc", "x", 1L, minAppVersion = "2.0.0")
+        val nonBlocking = SnapshotManifest("v", "oc", "x", 1L, minAppVersion = "1.0.0")
+        val empty = SnapshotManifest("v", "oc", "x", 1L, minAppVersion = "")
+        assertTrue(isBlockedByMinAppVersion("1.9.9", blocking), "当前 < 要求 → 阻断")
+        assertFalse(isBlockedByMinAppVersion("2.0.0", blocking), "等于要求 → 放行")
+        assertFalse(isBlockedByMinAppVersion("1.5.0", nonBlocking), "已满足 → 放行")
+        assertFalse(isBlockedByMinAppVersion("1.5.0", empty), "minAppVersion 空 → 不阻断")
+        assertFalse(isBlockedByMinAppVersion("1.5.0", null), "无 manifest → 不阻断")
     }
 }

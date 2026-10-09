@@ -19,6 +19,22 @@ internal fun compareSemver(a: String, b: String): Int {
 }
 
 /**
+ * bootSequence 决策(P0-4): 是否需要安装/重装快照。
+ * 未安装(installed==null) 或 bundled 的 snapshotVersion 与已装不同 → 需要。
+ * 从 EngineService.bootSequenceInner 抽出以便纯 JVM 单测。
+ */
+internal fun needsSnapshotInstall(installedVersion: String?, bundled: SnapshotManifest?): Boolean =
+    installedVersion == null || (bundled != null && bundled.snapshotVersion != installedVersion)
+
+/**
+ * bootSequence 决策(minAppVersion, P1 §3.1 / M3-6): 当前 App 是否被快照要求的最低版本阻断。
+ * 仅当 manifest 存在、minAppVersion 非空、且 当前版本 < 要求版本 时为 true。
+ */
+internal fun isBlockedByMinAppVersion(appVersion: String, bundled: SnapshotManifest?): Boolean =
+    bundled != null && bundled.minAppVersion.isNotBlank() &&
+        compareSemver(appVersion, bundled.minAppVersion) < 0
+
+/**
  * L2 启动自愈特征串匹配（P1 §3.2 四条 + P2b §6 正面样例；负面样例强制排除防误判）。
  *
  * 正面串 1-4 = P1 §3.2 四条；其余 = P2b §6 登记正面样例（§6 第 8 条为负面样例）。
