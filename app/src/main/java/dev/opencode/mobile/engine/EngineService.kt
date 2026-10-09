@@ -308,6 +308,14 @@ class EngineService : Service() {
         //        从不比对 bundled manifest 的 snapshotVersion, App 升级带来新快照时旧 rootfs 永不替换,
         //        P6 M3-2 验收项不可能通过。
         val bundled = readBundledManifest()
+        // [P1 minAppVersion] 快照要求的最低 App 版本校验(P1 §3.1 / M3-6): 旧 App 不得
+        // 安装/下载不兼容的新快照, 直接阻断并引导升级。
+        if (bundled != null && bundled.minAppVersion.isNotBlank() &&
+            compareSemver(appVersionName(), bundled.minAppVersion) < 0) {
+            return fail("需升级 App",
+                "快照(oc ${bundled.ocVersion})要求 App ≥ ${bundled.minAppVersion}, " +
+                    "当前 App ${appVersionName()}。请升级 App 后再启动本地引擎(P1 §3.1)。")
+        }
         val installed = installer.installedVersion()
         val needsInstall = installed == null ||
             (bundled != null && bundled.snapshotVersion != installed)
@@ -385,6 +393,17 @@ class EngineService : Service() {
     private fun appVersionName(): String = runCatching {
         packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
     }.getOrDefault("0.0.0")
+
+    /** 语义化版本比较(X.Y.Z); 预发布后缀(如 -local)忽略, 非数字段按 0。返回 <0/0/>0 */
+    private fun compareSemver(a: String, b: String): Int {
+        fun parts(s: String) = s.substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
+        val pa = parts(a); val pb = parts(b)
+        for (i in 0 until maxOf(pa.size, pb.size)) {
+            val c = pa.getOrElse(i) { 0 }.compareTo(pb.getOrElse(i) { 0 })
+            if (c != 0) return c
+        }
+        return 0
+    }
 
     /**
      * 引擎守护循环:
@@ -865,8 +884,10 @@ class EngineService : Service() {
         // file 字段(C1 定稿)用于 lite 下载; 缺失时回落默认名(向后兼容旧 manifest)
         val fileName = Regex("\"file\"\\s*:\\s*\"([^\"]+)\"").find(raw)?.groupValues?.get(1)
             ?: "oc-ubuntu-arm64.tar.gz"
+        // minAppVersion(C1 定稿): 快照要求的最低 App 版本; 缺失回落空串(不校验)
+        val minApp = Regex("\"minAppVersion\"\\s*:\\s*\"([^\"]+)\"").find(raw)?.groupValues?.get(1) ?: ""
         SnapshotManifest(s("snapshotVersion"), s("ocVersion"), s("sha256"),
-            Regex("\"size\"\\s*:\\s*(\\d+)").find(raw)!!.groupValues[1].toLong(), fileName)
+            Regex("\"size\"\\s*:\\s*(\\d+)").find(raw)!!.groupValues[1].toLong(), fileName, minApp)
     }.getOrNull()
 
     // ── 冻结参数与常量(出处见行内注释) ──────────────────────────

@@ -41,6 +41,8 @@ data class SnapshotManifest(
     val size: Long,
     /** 快照文件名(C1 manifest 的 `file` 字段); lite 下载与落盘用。默认与 CI 产出一致 */
     val file: String = "oc-ubuntu-arm64.tar.gz",
+    /** 快照要求的最低 App 版本(C1 `minAppVersion`); 空串=不校验。lite 下载/安装前须比对 */
+    val minAppVersion: String = "",
 )
 
 /** 安装进度: phase 用于 UI 分段展示(校验/解压/收尾) */

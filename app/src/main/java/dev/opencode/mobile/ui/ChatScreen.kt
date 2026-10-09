@@ -86,6 +86,12 @@ class ChatController(private val scope: CoroutineScope) {
     val errorBanner = MutableStateFlow<String?>(null)
     val sending = MutableStateFlow(false)
 
+    /**
+     * /doc 刷新完成信号。EngineClient 的 doc/endpoints/degraded 是普通 var(非 Compose State),
+     * 刷新后对象引用不变 → 必须靠本计数器变化触发重组, UI 才能读到新的端点可用性(P1 §3.4)。
+     */
+    val docEpoch = MutableStateFlow(0)
+
     /** client 重建入口(引擎 handle 轮换 / None 配置变更); null = 引擎不可用(清空展示) */
     fun bind(newClient: EngineClient?) {
         sse?.cancel(); sse = null
@@ -102,6 +108,13 @@ class ChatController(private val scope: CoroutineScope) {
             },
             onResync = ::resync,
         )
+        // [P1 refreshDoc 接线] 拉 /doc 校验端点并获取 schema(此前 refreshDoc 是死代码,
+        // 导致 endpoints 恒 UNKNOWN、degraded 恒 true、重命名/删除永久禁用)。
+        // 完成即 bump docEpoch 触发重组。
+        scope.launch {
+            newClient.refreshDoc()
+            docEpoch.value += 1
+        }
         scope.launch { loadSessions() }
         activeSessionId.value?.let { id -> scope.launch { loadMessages(id) } }
     }
@@ -289,10 +302,12 @@ fun SessionsPane(
     val engineState by EngineBus.state.collectAsState()
     val client by chat.currentClient.collectAsState()
     val mode by app.engineMode.collectAsState()
+    // 读取 docEpoch(/doc 刷新完成信号), 使端点可用性在 /doc 返回后触发重组
+    val docEpoch by chat.docEpoch.collectAsState()
     var showCreate by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<SessionSummary?>(null) }
-    val canRename = client?.endpoints?.renameSession == EndpointAvail.OK    // PATCH /session/{id}(P1 §3.4)
-    val canDelete = client?.endpoints?.deleteSession == EndpointAvail.OK    // DELETE /session/{id}(P1 §3.4)
+    val canRename = remember(docEpoch, client) { client?.endpoints?.renameSession == EndpointAvail.OK }    // PATCH /session/{id}
+    val canDelete = remember(docEpoch, client) { client?.endpoints?.deleteSession == EndpointAvail.OK }    // DELETE /session/{id}
 
     Column(Modifier.fillMaxSize()) {
         // 顶栏: 标题 + 终端入口 + 设置入口
@@ -312,7 +327,7 @@ fun SessionsPane(
         }
 
         // 会话列表(GET /session; /doc 判 MISSING → 禁用创建, P1 §3.4)
-        val canCreate = client?.endpoints?.createSession != EndpointAvail.MISSING && client != null
+        val canCreate = remember(docEpoch, client) { client?.endpoints?.createSession != EndpointAvail.MISSING && client != null }
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp),
             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("会话(${sessions.size})", style = MaterialTheme.typography.titleSmall)
@@ -360,11 +375,12 @@ fun ChatPane(chat: ChatController, onBack: () -> Unit) {
     val error by chat.errorBanner.collectAsState()
     val permissions by chat.permissionQueue.collectAsState()
     val client by chat.currentClient.collectAsState()
+    val docEpoch by chat.docEpoch.collectAsState()
     var input by remember { mutableStateOf("") }
 
     val endpoints = client?.endpoints
-    val canPrompt = endpoints?.promptAsync != EndpointAvail.MISSING && client != null
-    val canAbort = endpoints?.abort == EndpointAvail.OK
+    val canPrompt = remember(docEpoch, client, endpoints) { endpoints?.promptAsync != EndpointAvail.MISSING && client != null }
+    val canAbort = remember(docEpoch, client, endpoints) { endpoints?.abort == EndpointAvail.OK }
 
     Column(Modifier.fillMaxSize()) {
         SimpleTopBar(

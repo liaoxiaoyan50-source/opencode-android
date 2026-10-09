@@ -62,6 +62,16 @@ class MainActivity : ComponentActivity() { // P3 MAIN_ACTIVITY(L798) 通知点�
 
         app = AppController(applicationContext, appScope)
 
+        // [安全/功能] API 33+ 运行时申请通知权限。Manifest 声明了 POST_NOTIFICATIONS,
+        // 但此前从不申请 → 引擎前台服务通知与 FAILED 诊断通知在真机上不可见。
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            runCatching {
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                    REQ_POST_NOTIFICATIONS)
+            }
+        }
+
         // M1-1: 本地模式开 App 自动拉引擎(Failed 终态不自动重启, 避免 D8 10 分钟窗内空转)
         if (app.engineMode.value == AppController.MODE_LOCAL &&
             EngineBus.state.value is EngineState.Stopped
@@ -75,6 +85,10 @@ class MainActivity : ComponentActivity() { // P3 MAIN_ACTIVITY(L798) 通知点�
     override fun onDestroy() {
         appScope.cancel() // 级联取消 client SSE/REST 协程; 引擎服务不受影响(独立生命周期)
         super.onDestroy()
+    }
+
+    private companion object {
+        const val REQ_POST_NOTIFICATIONS = 100
     }
 }
 
