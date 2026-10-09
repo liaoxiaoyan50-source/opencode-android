@@ -246,7 +246,6 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with: { name: snapshot, path: dist/ }
-
       - name: Derive app version from tag
         run: |
           APP_VERSION_NAME="${GITHUB_REF_NAME#v}"
@@ -281,6 +280,31 @@ jobs:
             exit 1
           fi
 
+      - name: Check gradle wrapper committed
+        run: |
+          # [PR3] wrapper 已入仓, 不再由 CI 现场生成(旧兜底逻辑因 run: 默认无 pipefail,
+          # `cmd | tee` 退出码恒 0 而误判成功, 曾连挂 run#43/44/45)。缺失即硬失败。
+          if [ ! -x ./gradlew ]; then
+            echo "::error::gradlew 未入仓或不可执行 — wrapper 必须入仓(gradlew + gradle/wrapper/*), 禁止 CI 现场生成"
+            exit 1
+          fi
+          test -f gradle/wrapper/gradle-wrapper.jar \
+            || { echo "::error::gradle/wrapper/gradle-wrapper.jar 缺失"; exit 1; }
+          grep -q 'gradle-8\.7-bin' gradle/wrapper/gradle-wrapper.properties \
+            || { echo "::error::gradle-wrapper.properties 未锁定 8.7 (版本漂移防护), 中止"; exit 1; }
+          echo "gradle wrapper 已入仓并锁定 8.7, 原样使用"
+
+      - name: "Compile assertion: both variants must compile"
+        run: |
+          set -o pipefail
+          ./gradlew :app:compileFullDebugKotlin :app:compileLiteDebugKotlin --stacktrace 2>&1 | tee compile-check.log
+          RC=${PIPESTATUS[0]}
+          if [ "${RC}" -ne 0 ]; then
+            echo "::error::编译断言失败 (RC=${RC}): full/lite 两变体必须均可编译。见 compile-check.log"
+            exit 1
+          fi
+          echo "编译断言通过: :app:compileFullDebugKotlin + :app:compileLiteDebugKotlin"
+
       - name: Build host binaries (proot + qemu-user, 16KB aligned)
         run: |
           set -o pipefail
@@ -295,36 +319,17 @@ jobs:
           [ -e "${LIBS[0]}" ] || { echo "::error::jniLibs 无产物, 两库编译未落位"; exit 1; }
           READELF="${READELF}" bash native/check-page-align.sh "${LIBS[@]}"
 
-      - name: Inject snapshot into full variant assets
+      - name: Inject snapshot into full/lite variant assets
         run: |
+          # full: tar.gz + manifest 内嵌(full 变体直接读 assets 安装)
           mkdir -p app/src/full/assets/snapshot
           cp dist/oc-ubuntu-arm64.tar.gz dist/manifest.json app/src/full/assets/snapshot/
-          ls -l app/src/full/assets/snapshot/
-
-      - name: Check gradle wrapper committed
-        run: |
-          if [ -x ./gradlew ]; then
-            echo "gradle wrapper 已入仓, 原样使用"
-          else
-            echo "::warning::gradlew 未入仓, 由 CI 用 setup-gradle 安装的 gradle 自动生成 wrapper (8.7)"
-            # [run#45 诊断增强] run#43/44 两轮 gradle wrapper 非零退出但零日志外带（采集
-            #   口径仅覆盖 proot/qemu）。run: 默认 bash -e 且无 pipefail —— `cmd | tee`
-            #   的退出码恒为 tee 的 0，不能判失败；改用重定向落盘 + 显式 RC + cat 回放。
-            set +e
-            gradle wrapper --gradle-version 8.7 --no-daemon > wrapper-gen.log 2>&1
-            WRAP_RC=$?
-            set -e
-            cat wrapper-gen.log
-            echo "[wrapper] gradle wrapper 退出码: WRAP_RC=${WRAP_RC}"
-            if [ "${WRAP_RC}" -ne 0 ]; then
-              echo "::error::gradle wrapper 命令非零退出 (RC=${WRAP_RC}, 完整日志已外带 wrapper-gen.log)"
-              exit 1
-            fi
-            test -x ./gradlew || { echo "::error::wrapper 自动生成失败 (./gradlew 不可执行)"; exit 1; }
-            grep -q 'gradle-8\.7-bin' gradle/wrapper/gradle-wrapper.properties \
-              || { echo "::error::gradle-wrapper.properties 未锁定 8.7 (版本漂移防护), 中止"; exit 1; }
-            echo "wrapper 已生成: gradlew + gradle/wrapper/* (distributionUrl=gradle-8.7-bin.zip), 后续构建经 ./gradlew 执行"
-          fi
+          # lite: 仅 manifest(小文件, 供首启下载时读取 file/sha256/size) —— 不含 tar.gz
+          # [PR8] lite 的下载链路依赖此 manifest; 缺它则 readBundledManifest() 返回 null → fail
+          mkdir -p app/src/lite/assets/snapshot
+          cp dist/manifest.json app/src/lite/assets/snapshot/
+          echo "full:"; ls -l app/src/full/assets/snapshot/
+          echo "lite:"; ls -l app/src/lite/assets/snapshot/
 
       - name: Restore keystore & build signed APKs (full/lite)
         env:
@@ -418,7 +423,7 @@ jobs:
           path: |
             proot-build.log
             qemu-build.log
-            wrapper-gen.log
+            compile-check.log
             gradle-build.log
           if-no-files-found: ignore
           retention-days: 7
@@ -456,6 +461,7 @@ jobs:
             echo "路径映射 (runner 工作区 ${GITHUB_WORKSPACE} → 本分支 ${JOB_DIR}/):"
             echo "  proot-build.log   → ${JOB_DIR}/${PFX}-proot-build.log (存在时)"
             echo "  qemu-build.log    → ${JOB_DIR}/${PFX}-qemu-build.log (存在时)"
+            echo "  compile-check.log → ${JOB_DIR}/${PFX}-compile-check.log (存在时, PR3 新增)"
             echo "  gradle-build.log  → ${JOB_DIR}/${PFX}-gradle-build.log (存在时)"
             echo ""
             echo "说明: 本分支永远只保留最近一次失败 job 的日志 (force 覆盖语义)。"
@@ -464,7 +470,7 @@ jobs:
 
           # 2) 拷贝本轮全部 tee 日志 (存在才拷; 与 Upload failure logs artifact 口径一致)
           if [ -f proot-build.log ];  then cp -f proot-build.log  "${LOGREPO}/${JOB_DIR}/${PFX}-proot-build.log";  fi
-          if [ -f wrapper-gen.log ];  then cp -f wrapper-gen.log  "${LOGREPO}/${JOB_DIR}/${PFX}-wrapper-gen.log";  fi
+          if [ -f compile-check.log ]; then cp -f compile-check.log "${LOGREPO}/${JOB_DIR}/${PFX}-compile-check.log"; fi
           if [ -f qemu-build.log ];   then cp -f qemu-build.log   "${LOGREPO}/${JOB_DIR}/${PFX}-qemu-build.log";   fi
           if [ -f gradle-build.log ]; then cp -f gradle-build.log "${LOGREPO}/${JOB_DIR}/${PFX}-gradle-build.log"; fi
 
