@@ -390,7 +390,12 @@ jobs:
           TMP="$(mktemp -d)"
           RC=0
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
-            unzip -q -j "${apk}" 'lib/arm64-v8a/libproot.so' 'lib/arm64-v8a/libqemu_aarch64.so' -d "${TMP}/pkg" \
+            # [Gate1b 修复] 必须 -o(覆盖): 循环第二轮(lite)解包时, 上一轮(full)解出的
+            # .so 仍在 ${TMP}/pkg, unzip 会弹 "replace? [y/n]" 交互提示; CI 非交互
+            # → 读 stdin 得 NULL → unzip 非零退出 → 被误判为「APK 内缺 .so」。
+            # 每轮先清空 pkg 目录, 并加 -o 双保险。
+            rm -rf "${TMP}/pkg"
+            unzip -q -o -j "${apk}" 'lib/arm64-v8a/libproot.so' 'lib/arm64-v8a/libqemu_aarch64.so' -d "${TMP}/pkg" \
               || { echo "::error::APK 内缺 libproot.so/libqemu_aarch64.so: ${apk}"; RC=1; continue; }
             READELF="${READELF}" bash native/check-page-align.sh "${TMP}"/pkg/*.so || RC=1
           done
