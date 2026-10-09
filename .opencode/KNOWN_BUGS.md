@@ -150,11 +150,31 @@
 
 ## 未修复 / 待办
 
+> 以下为 `/gate` 复验（专家团第二轮）确认的**可发布性缺口**——不影响当前 `main` 真绿，
+> 但在打正式 tag 发布前应逐项处理。
+
 | # | 位置 | 问题 | 级别 |
 |---|---|---|---|
-| — | 全仓库 | UI 层（Compose）仍无测试（需 Robolectric 或 Compose 测试基建） | — |
+| G-1 | 发布路径 | **tag 路径零验证**：仓库无 tag，`job_release`/签名 Secrets 硬失败/ tag 口径 gate 从未运行，发布链路全是纸面。发布前需打一个 `v*` 预发 tag 跑通全链 | 高 |
+| G-2 | `app/build.gradle.kts:144` | **lint 缺席**：`checkReleaseBuilds = false` 且 workflow 无独立 lint step | 中 |
+| G-3 | `EngineClient.kt` / `EngineService.kt` | **测试护栏缺口**：`parseEvent`(:79)、`DynamicBody`(:215)、`SseQuota` 配额、`SseConnection` 生命周期、`EngineService` 启动链均无测试——正是历史 P0 bug 所在区，改坏仍全绿 | 中 |
+| G-4 | 全仓库 | **UI 层零测试**（Compose，约 1800 行），需 Robolectric/Compose 测试基建 | 中 |
+| G-5 | `release.yml:237` / `app/build.gradle.kts` | 可复现性：**NDK 未锁版本**（`ls ndk/* \| sort -V \| tail -1` 取最新）；无 `ndkVersion`；无依赖校验和 / lockfile | 中 |
+| G-6 | `release.yml:269-274` | `Release blocker` 的 grep 只匹配**精确空默认字面量**；脚本改引号/删行即静默通过。应改为更鲁棒的空值检测 | 中 |
+| G-7 | `snapshot/build-snapshot.sh:169,206-219` | Ubuntu base 与 opencode 包下载**无 sha256 校验**（opencode 仅比对版本字符串） | 低 |
 | — | `SettingsScreen.kt` | 未加 `snapshot_mirror` 的设置项 UI（引擎层已读该 prefs 键，用户暂需手动设置） | P3 |
-| — | 构建验证 | 完整 Android 构建未跑通（本环境缺 `platform-35`），首次真机/CI 构建需预留调试余量 | — |
+| — | 构建验证 | 本环境缺 `platform-35`，无法本地完整构建；以真实 CI（run #58 全绿）为准 | — |
+
+## `/gate` 复验结论（专家团 · qa + release-ops）
+
+- **CI 修复 6/6 PASS**（wrapper 官方 8.7 · Gate4 regex 对齐 · Gate1b `-o`+清目录 ·
+  单测 step 接入双通道 · smoke 单行脚本 · `continue-on-error` 仅限非 tag），
+  **无 gate 被架空、无把失败降级为 warning 架空产品门禁**。
+- **run #58 的 smoke 为真绿**（非 `continue-on-error` 掩盖）：日志实证 `PAGESIZE=16384` +
+  `smoke 完成 (HARD=0)` + 步骤 conclusion=success；仅 arm64 APK 装入 x86_64 镜像的
+  安装步骤按设计降级 warning（已知 ABI 边界）。
+- 结论：**门禁本身已可信**；距「可安全发布」的差距在 **被测代码面过窄（G-3/G-4）与
+  发布路径从未运行（G-1）**，非门禁有洞。
 
 
 ---
