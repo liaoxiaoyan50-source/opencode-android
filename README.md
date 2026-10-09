@@ -1,4 +1,4 @@
-# OpenCode Android 移动端 APP 全栈开发方案
+# OpenCode Android 移动端 APP 
 
 > **声明**：本项目为社区驱动的第三方打包工程，"OpenCode" 名称仅用于标识所封装的上游工具。本项目与 OpenCode 官方团队无关、非官方出品。上游项目：https://github.com/anomalyco/opencode （Apache-2.0）；构建脚本所引用的 proot（GPL-2.0+）、qemu（GPL-2.0+）等组件许可见 `team-output/P2b-原生编译说明.md` 与 P5 发布运维说明的第三方许可条款。
 
