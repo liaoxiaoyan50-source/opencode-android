@@ -265,6 +265,9 @@ object SseQuota {
 
     /** 当前已用名额(诊断用: 排查 QUOTA_DENIED 时观察是否泄漏) */
     fun inUse(): Int = used.get()
+
+    /** 仅供单测重置(生产路径不调用), 保证用例间隔离 */
+    internal fun resetForTest() { used.set(0) }
 }
 
 /**

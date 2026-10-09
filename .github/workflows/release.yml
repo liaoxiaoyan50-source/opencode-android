@@ -266,19 +266,33 @@ jobs:
 
       - name: "Release blocker: third-party SHA256 must be configured"
         run: |
-          MISSING="$(grep -E \
-            -e '^ZLIB_SHA256="\$\{ZLIB_SHA256:-\}"$' \
-            -e '^LIBICONV_SHA256="\$\{LIBICONV_SHA256:-\}"$' \
-            -e '^PCRE2_SHA256="\$\{PCRE2_SHA256:-\}"$' \
-            -e '^GLIB_SHA256="\$\{GLIB_SHA256:-\}"$' \
-            native/build-qemu-user-static.sh | cut -d= -f1 || true)"
-          if [ -n "${MISSING}" ]; then
-            echo "::error::发布阻断 (P2b §7-1): 以下第三方依赖 SHA256 仍为空, 处于不可发布状态:"
-            echo "${MISSING}" | sed 's/^/    /'
-            echo "  补齐: 在 native/build-qemu-user-static.sh 填默认值 (核对 zlib.net fossils /"
-            echo "  ftp.gnu.org / PCRE2 GitHub Releases / download.gnome.org), 或改经 CI 环境变量注入并同步调整本 step"
+          # [G-6] 鲁棒化: 解析每个 ${VAR:-<default>} 的默认值, 为空或缺失行即判「未配置」。
+          # 旧写法用精确空字面量正则(^VAR="\$\{VAR:-\}"$), 把写法改成 ="" 或删行都会静默通过。
+          # 同时覆盖 proot 脚本(talloc/shmem), 不再只查 qemu 脚本。
+          missing=""
+          scan() {
+            file="$1"; shift
+            for v in "$@"; do
+              line="$(grep -E "^${v}=" "$file" | head -n1 || true)"
+              if [ -z "$line" ]; then missing="${missing} ${v}(${file}: 未定义)"; continue; fi
+              val="$(printf '%s' "${line#*=}" | tr -d '"' | tr -d ' ')"
+              if printf '%s' "$val" | grep -q ':-'; then
+                dflt="$(printf '%s' "$val" | sed -E 's/.*:-([^}]*)\}.*/\1/')"
+              else
+                dflt="$val"
+              fi
+              [ -n "$dflt" ] || missing="${missing} ${v}(${file})"
+            done
+          }
+          scan native/build-qemu-user-static.sh ZLIB_SHA256 LIBICONV_SHA256 PCRE2_SHA256 GLIB_SHA256
+          scan native/build-proot.sh TALLOC_SHA256 SHMEM_SHA256
+          if [ -n "${missing}" ]; then
+            echo "::error::发布阻断 (P2b §7-1): 以下第三方依赖 SHA256 未配置(空或缺失行), 不可发布:"
+            for m in ${missing}; do echo "    ${m}"; done
+            echo "  补齐: 在对应脚本填默认值, 或改经 CI 环境变量注入并同步调整本 step"
             exit 1
           fi
+          echo "third-party SHA256 均已配置: qemu(zlib/libiconv/pcre2/glib) + proot(talloc/shmem)"
 
       - name: Check gradle wrapper committed
         run: |

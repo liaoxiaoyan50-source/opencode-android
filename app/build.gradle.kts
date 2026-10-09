@@ -140,8 +140,15 @@ android {
         compose = true
     }
     lint {
-        // lintVital 不拦 assembleRelease（质量门禁另行接入，勿让 lint 阻断出包链路）
-        checkReleaseBuilds = false
+        // [G-2] 开启 lintVital 作为 release 出包门禁: lintVitalRelease 只查 fatal 级问题
+        // (如缺权限、资源引用断裂等), 误报风险低。此前 false = 出包链路无任何静态检查。
+        // 完整 lint(警告级)仍需单独 triage, 见 KNOWN_BUGS G-2。
+        checkReleaseBuilds = true
+    }
+    testOptions {
+        // 单测里 android.jar 桩方法默认抛异常; 置 true 使其返回默认值, 避免偶发 Stub! 崩溃。
+        // (org.json 另经 testImplementation 引入真实实现, 不依赖此开关。)
+        unitTests.isReturnDefaultValues = true
     }
 }
 
@@ -183,6 +190,9 @@ dependencies {
     // [PR10] lite 下载测试用 MockWebServer。注意: Android 单测编译环境不含
     // com.sun.net.httpserver(JDK 内置但不在 Android 编译类路径), 故不能用它起本地服务。
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    // [G-3] parseEvent/DynamicBody/ApiDoc 等依赖 org.json。Android 单测的 android.jar
+    // 里 org.json 是 throw-Stub, 必须引入真实实现, 否则 JSONObject 一调用即抛。
+    testImplementation("org.json:json:20231013")
 
     // ⚠ 依赖红线（P4 §6-2）: 不引 androidx.navigation:navigation-compose 与
     //   androidx.security:security-crypto —— UI 层已自实现等价能力，引入反而增依赖面。

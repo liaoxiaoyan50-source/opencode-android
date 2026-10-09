@@ -394,17 +394,6 @@ class EngineService : Service() {
         packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
     }.getOrDefault("0.0.0")
 
-    /** 语义化版本比较(X.Y.Z); 预发布后缀(如 -local)忽略, 非数字段按 0。返回 <0/0/>0 */
-    private fun compareSemver(a: String, b: String): Int {
-        fun parts(s: String) = s.substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
-        val pa = parts(a); val pb = parts(b)
-        for (i in 0 until maxOf(pa.size, pb.size)) {
-            val c = pa.getOrElse(i) { 0 }.compareTo(pb.getOrElse(i) { 0 })
-            if (c != 0) return c
-        }
-        return 0
-    }
-
     /**
      * 引擎守护循环:
      *   拉起 → 健康检查(P1 §3.6) → READY(常驻) → 进程意外退出 → 失败处理;
@@ -454,7 +443,7 @@ class EngineService : Service() {
             // 触发条件: 健康检查 60s 超时(进程存活或退出, wasReady=false 覆盖两者)、
             // 当前 L1 结论为 DIRECT、尚未自愈过; 曾 READY 的运行期崩溃不走 L2(属 D8 范畴)
             if (!wasReady && l2 == L2State.NONE && mode == ExecMode.DIRECT) {
-                val hit = matchSelfHealSignatures(readLogTail(L2_LOG_TAIL_BYTES))
+                val hit = SelfHeal.match(readLogTail(L2_LOG_TAIL_BYTES))
                 if (hit != null) {
                     l2 = L2State.RETRYING
                     ExecCompat.clearCache(filesDir)  // 处置 1: 删除 .exec-mode 缓存
@@ -525,46 +514,6 @@ class EngineService : Service() {
                 }
             }
             delay(gap); gap = (gap * 2).coerceAtMost(HEALTH_INTERVAL_MAX_MS)
-        }
-        return null
-    }
-
-    // ── L2 自愈: 日志特征串匹配(P1 §3.2 四条 + P2b §6 正面 7 条; 负面 1 条强制排除) ──
-
-    /**
-     * 正面特征串(小写化子串匹配, 大小写不敏感口径按 P2b §6 建议):
-     *   1-4 = P1 §3.2 四条; 其余 = P2b §6 登记正面样例(P2b §6 第 8 条为负面样例, 见下)。
-     * 最终清单以 M0 真机实测修订为准(P1 §2 冻结规则允许参数级修正), 详见 P3 文档 §3.3。
-     */
-    private val SELF_HEAL_POSITIVE = listOf(
-        "permission denied",                    // P1 §3.2 / P2b §6-1: noexec 或 SELinux 拒绝 exec
-        "exec format error",                    // P1 §3.2 / P2b §6-2: ENOEXEC, 架构/对齐问题
-        "failed to load",                       // P1 §3.2: 加载失败
-        "error while loading shared libraries", // P1 §3.2 / P2b §6-3: 库文件损坏或缺库
-        "mmap failed",                          // P2b §6-4: 映射失败(16KB page 遇 4KB 假设等)
-        "mmap: cannot allocate memory",         // P2b §6-4: 同上
-        "failed to map",                        // P2b §6-5: qemu linux-user 映射阶段
-        "map_fixed",                            // P2b §6-5: MAP_FIXED 相关报错(小写化匹配)
-        "qemu: uncaught target signal",         // P2b §6-6: guest 异常信号
-        // P2b §6-7 「ptrace ... Operation not permitted」为共现规则, 单独处理(见 matchSelfHealSignatures)
-    )
-
-    /** 负面样例(P2b §6-8): proot 非致命警告, 正常启动即输出, 必须排除防 L2 误触发清缓存循环 */
-    private val SELF_HEAL_NEGATIVE = listOf("can't sanitize binding")
-
-    /**
-     * L2 特征串匹配: 行级匹配 — 含负面串的行先剔除, 再匹配正面串;
-     * 「ptrace ... Operation not permitted」按同行共现判定。
-     * @return 命中的特征串描述(进诊断报告/引擎日志), 未命中返回 null
-     */
-    internal fun matchSelfHealSignatures(tail: String): String? {
-        for (rawLine in tail.lineSequence()) {
-            val line = rawLine.lowercase()
-            if (SELF_HEAL_NEGATIVE.any { line.contains(it) }) continue // 负面行剔除(防误判)
-            for (sig in SELF_HEAL_POSITIVE) if (line.contains(sig)) return sig
-            if (line.contains("ptrace") && line.contains("operation not permitted")) {
-                return "ptrace ... Operation not permitted" // P2b §6-7: 内核禁 ptrace, 环境级失败
-            }
         }
         return null
     }
