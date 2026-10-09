@@ -73,6 +73,9 @@ val ciSigning: List<String>? = listOf(
 android {
     namespace = "dev.opencode.mobile"               // UI 包名 dev.opencode.mobile.ui 之下的 app 层
     compileSdk = 35
+    // [G-5] 锁定 NDK 版本, 防 runner 镜像升级导致同代码产出不同 .so。
+    // 与 release.yml env.NDK_VERSION 同一口径(升级两处同步改)。
+    ndkVersion = System.getenv("NDK_VERSION") ?: "30.0.16248370"
 
     defaultConfig {
         applicationId = "dev.opencode.mobile"

@@ -43,6 +43,9 @@ UBUNTU_BASE_VER="${UBUNTU_BASE_VER:-}"   # 空=走候选探测；非空=硬钉�
 # 取 glibc 版（proot Ubuntu 为 glibc 环境）；直链锁定，不用 pipe-to-bash 安装脚本
 # （防安装脚本未来改版漂移）。升级 OC_VERSION 时须核对 releases 页资产名仍在。
 OPENCODE_ASSET="opencode-linux-arm64.tar.gz"
+# [G-7] opencode 资产 sha256(v${OC_VERSION} 实测)。升级 OC_VERSION 必须同步更新本值
+# (与 qemu/proot 的第三方 sha256 同口径: 缺省为空则脚本侧拦截, 见下方校验)。
+OPENCODE_SHA256="${OPENCODE_SHA256:-bbdb3f00c2c51e42e315525233151309724226a8776da8e9145e3b0fa3d5310f}"
 OPENCODE_RELEASE_URL="https://github.com/anomalyco/opencode/releases/download/v${OC_VERSION}/${OPENCODE_ASSET}"
 OPENCODE_RELEASES_PAGE="https://github.com/anomalyco/opencode/releases"
 
@@ -165,8 +168,19 @@ echo "==> [1/6] 解包 ubuntu-base ${UBUNTU_BASE_VER} arm64"
 umount -l "${ROOTFS}/proc" "${ROOTFS}/sys" "${ROOTFS}/dev" 2>/dev/null || true
 rm -rf "${ROOTFS}"
 mkdir -p "${ROOTFS}"
-# pipefail 下 curl 失败（含 404/断流）即整体失败；--retry 抗 cdimage 偶发抖动
-curl -fsSL --retry 5 --retry-delay 3 "${UBUNTU_BASE_URL}" | tar xz -C "${ROOTFS}"
+# [G-7] 校验 ubuntu-base 完整性: 与上游同目录 SHA256SUMS 比对(动态取, 不硬编码版本哈希)。
+# pipefail 下 curl 失败即整体失败; 先落盘校验再解包(curl|tar 无法在解包前校验)。
+UB_TMP="$(mktemp)"
+curl -fsSL --retry 5 --retry-delay 3 -o "${UB_TMP}" "${UBUNTU_BASE_URL}"
+UB_SUMS="$(curl -fsSL --retry 3 "${UBUNTU_BASE_URL%/*}/SHA256SUMS" || true)"
+UB_NAME="$(basename "${UBUNTU_BASE_URL}")"
+UB_EXPECT="$(printf '%s\n' "${UB_SUMS}" | awk -v f="${UB_NAME}" '{n=$2; sub(/^\*/,"",n); if (n==f) print $1}')"
+[[ -n "${UB_EXPECT}" ]] || die "ubuntu-base: 未能从 SHA256SUMS 取得 ${UB_NAME} 的期望哈希(上游目录结构可能变更)"
+UB_ACTUAL="$(sha256sum "${UB_TMP}" | cut -d' ' -f1)"
+[[ "${UB_EXPECT}" = "${UB_ACTUAL}" ]] || die "ubuntu-base SHA256 不匹配: 期望 ${UB_EXPECT} 实际 ${UB_ACTUAL}"
+tar xzf "${UB_TMP}" -C "${ROOTFS}"
+rm -f "${UB_TMP}"
+echo "==> [1/6] ubuntu-base SHA256 校验通过 (${UB_ACTUAL})"
 
 # ───────────────────────── [2/6] 基础配置注入 ─────────────────────────
 echo "==> [2/6] 注入基础配置（DNS / 环境 / locale）"
@@ -204,6 +218,8 @@ locale-gen C.UTF-8 >/dev/null 2>&1 || true
 # opencode 官方 linux-arm64（glibc）单文件二进制：直链 release 资产锁定版本。
 # 升级 OC_VERSION 前先核对资产名仍在: ${OPENCODE_RELEASES_PAGE}
 curl -fsSL --retry 5 --retry-delay 3 -o /tmp/opencode.tar.gz "${OPENCODE_RELEASE_URL}"
+# [G-7] 校验 opencode 资产完整性(sha256 由 host 侧注入本脚本)。升级 OC_VERSION 必须同步 OPENCODE_SHA256。
+echo "${OPENCODE_SHA256}  /tmp/opencode.tar.gz" | sha256sum -c - >/dev/null || { echo "FATAL: opencode 资产 sha256 不匹配(升级 OC_VERSION 需同步更新 OPENCODE_SHA256)" >&2; exit 1; }
 mkdir -p /tmp/oc-unpack
 tar xzf /tmp/opencode.tar.gz -C /tmp/oc-unpack
 OC_BIN="\$(find /tmp/oc-unpack -type f -name opencode -print -quit)"
