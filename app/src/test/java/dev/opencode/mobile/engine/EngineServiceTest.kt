@@ -10,6 +10,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import kotlin.test.assertTrue
 
@@ -17,8 +18,13 @@ import kotlin.test.assertTrue
 @Config(sdk = [34])
 class EngineServiceTest {
 
-    private fun service(): EngineService =
-        Robolectric.buildService(EngineService::class.java).create().get()
+    private fun service(): EngineService {
+        // Robolectric 不填充 ApplicationInfo.nativeLibraryDir(真实设备必有值)。
+        // buildProotCommand 经 getNativeDir 读取它, 故测试前注入一个伪路径。
+        RuntimeEnvironment.getApplication().applicationInfo.nativeLibraryDir =
+            "/data/app/dev.opencode.mobile/lib/arm64"
+        return Robolectric.buildService(EngineService::class.java).create().get()
+    }
 
     @Test
     fun `direct mode command follows C6 contract`() {
