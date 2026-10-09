@@ -38,6 +38,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
+/** 日志 TAG。文件级(非 companion), 供同文件的顶层类 SseConnection 与 EngineClient 共用 */
+private const val TAG = "OpenCodeUI"
+
 /** REST 调用结果; Err.code==401 表示凭据过期(引擎重启密码轮换, 见 P4 文档 §2.2) */
 sealed class ApiResult<out T> {
     data class Ok<T>(val value: T, val code: Int) : ApiResult<T>()
@@ -180,7 +183,7 @@ class ApiDoc internal constructor(val root: JSONObject) {
 enum class EndpointAvail { OK, MISSING, UNKNOWN }
 
 /** 端点注册表: /doc 拉取成功 → 逐端点判 OK/MISSING; /doc 不可用 → 全 UNKNOWN(degraded, UI 告警) */
-class Endpoints(doc: ApiDoc?) {
+class Endpoints(private val doc: ApiDoc?) {
     val docAvailable: Boolean = doc != null
 
     private fun avail(template: String, method: String): EndpointAvail = when {
@@ -457,9 +460,7 @@ class EngineClient(
         return SseSubscription(job) { conn.closed = true }
     }
 
-    companion object {
-        const val TAG = "OpenCodeUI"
-    }
+    // TAG 提升为文件级(见文件顶部), 供同文件顶层类 SseConnection 访问
 }
 
 /**

@@ -267,6 +267,7 @@ class ChatController(private val scope: CoroutineScope) {
                     else list + ChatMessage(key = key, role = "assistant", text = text, streaming = true)
                 }
             }
+            Unit // [fix] 分支块不得以无 else 的 if 结尾(表达式体 when 要求各分支类型确定)
         }
         is EngineEvent.PermissionAsked -> permissionQueue.update { it + PermissionRequest(ev.sessionId, ev.permissionId, ev.title, ev.description, ev.raw) }
         is EngineEvent.SessionError -> errorBanner.value = ev.message ?: "会话错误(见引擎日志)"
