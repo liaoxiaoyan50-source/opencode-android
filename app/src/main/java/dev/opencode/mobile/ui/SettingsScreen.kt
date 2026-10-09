@@ -133,7 +133,7 @@ object KeyVault {
      * 组装 auth.json 文本(opencode 上游格式: {"<provider>":{"type":"api","key":"..."}})。
      * 经 Settings.authJsonProvider 内存回调交给引擎层写 oc-auth(P3 §7.1; UI 不持久化明文)。
      * 注: auth.json 内部 schema 未在 P1 冻结(P1 §3.5 仅冻结文件路径与权限 600), 按上游当前
-n     *     格式组装, 版本漂移对策见 P4 §8 请终裁项。
+     *     格式组装, 版本漂移对策见 P4 §8 请终裁项。
      */
     fun buildAuthJson(context: Context): String {
         val root = JSONObject()

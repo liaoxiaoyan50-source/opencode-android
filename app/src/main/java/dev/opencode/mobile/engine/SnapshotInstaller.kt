@@ -147,6 +147,32 @@ class SnapshotInstaller(
                         throw SecurityException("快照包含非法路径: ${entry.name}")
                     }
                     if (entry.isDirectory) { target.mkdirs(); continue }
+                    // [P0-symlink 修复] tar 保留符号链接(build-snapshot.sh 的 tar 未加
+                    // --dereference), Ubuntu rootfs 含大量 symlink(usrmerge 的 /bin->usr/bin、
+                    // /lib->usr/lib、/etc/alternatives/* 等)。原实现把非目录条目一律按普通
+                    // 文件写入, symlink 条目 size=0 → 被写成【空文件】→ 装出的 rootfs 损坏
+                    // (shell/二进制路径失效)。此处按条目类型分别还原。
+                    when {
+                        entry.isSymbolicLink -> {
+                            target.parentFile?.mkdirs()
+                            if (target.exists()) target.delete()
+                            java.nio.file.Files.createSymbolicLink(
+                                target.toPath(), java.nio.file.Paths.get(entry.linkName))
+                            continue
+                        }
+                        entry.isLink -> { // 硬链接(LF_LINK)
+                            val src = File(tmpDir, entry.linkName).canonicalFile
+                            target.parentFile?.mkdirs()
+                            if (src.exists()) {
+                                if (target.exists()) target.delete()
+                                runCatching { java.nio.file.Files.createLink(target.toPath(), src.toPath()) }
+                                    .onFailure { src.copyTo(target, overwrite = true) }
+                            }
+                            continue
+                        }
+                        entry.isCharacterDevice || entry.isBlockDevice || entry.isFIFO ->
+                            continue // 设备节点/FIFO 不应出现在 rootfs; 跳过而非误写成普通文件
+                    }
                     target.parentFile?.mkdirs()
                     java.io.FileOutputStream(target).use { out ->
                         val buf = ByteArray(64 * 1024)

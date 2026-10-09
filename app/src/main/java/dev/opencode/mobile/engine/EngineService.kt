@@ -43,6 +43,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -400,7 +401,7 @@ class EngineService : Service() {
         var backoffMs = BACKOFF_INITIAL_MS
         val failureTimes = ArrayDeque<Long>()   // D8: 10 分钟滑动窗失败时间戳
 
-        while (scope.isActive) {
+        while (currentCoroutineContext().isActive) {
             // 每轮重新探测端口: 探测-占用 TOCTOU 竞态 P1 §7-5 已定稿接受(绑定失败由健康检查超时兜底)
             currentPort = allocatePort()
             currentMode = mode
@@ -424,7 +425,7 @@ class EngineService : Service() {
                 handle.tryEmit(EngineHandle("http://127.0.0.1:$currentPort", enginePassword, version))
                 proc.waitFor()                       // 常驻运行: 进程意外退出后落回失败处理
                 releaseWakeLock()
-                if (!scope.isActive) return
+                if (!currentCoroutineContext().isActive) return
                 state.value = EngineState.Starting(mode, currentPort)
                 appendEngineNote("[${now()}] 引擎进程意外退出(exit=${runCatching { proc.exitValue() }.getOrDefault("?")}) → 守护重启")
             }

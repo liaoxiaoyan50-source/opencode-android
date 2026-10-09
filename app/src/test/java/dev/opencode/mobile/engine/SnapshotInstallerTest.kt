@@ -79,6 +79,17 @@ class SnapshotInstallerTest {
             installer.install(openStream = openStream, totalBytes = -1, manifest = manifest)
         }
 
+    private fun makeTarGzWithSymlink(linkName: String, target: String): ByteArray {
+        val bos = ByteArrayOutputStream()
+        org.apache.commons.compress.archivers.tar.TarArchiveOutputStream(
+            GZIPOutputStream(bos).buffered()).use { tar ->
+            val e = TarArchiveEntry(linkName, org.apache.commons.compress.archivers.tar.TarConstants.LF_SYMLINK)
+            e.linkName = target
+            tar.putArchiveEntry(e); tar.closeArchiveEntry()
+        }
+        return bos.toByteArray()
+    }
+
     private fun manifestOf(bytes: ByteArray, version: String) = SnapshotManifest(
         snapshotVersion = version, ocVersion = "1.18.34",
         sha256 = sha256Of(bytes), size = bytes.size.toLong(),
@@ -206,5 +217,20 @@ class SnapshotInstallerTest {
         // 非 ready 状态
         installer.dirs.metaFile.writeText("""{"snapshotVersion":"v-x","state":"failed"}""")
         assertNull(installer.installedVersion())
+    }
+
+    // ── 8. 符号链接必须还原为 symlink(而非空文件) ──
+    // build-snapshot.sh 的 tar 未加 --dereference, Ubuntu rootfs 含大量 symlink
+    // (usrmerge 的 /bin->usr/bin 等)。若按普通文件写入会得到空文件 → rootfs 损坏。
+
+    @Test
+    fun `symlink entries restored as symbolic links`() = runTest {
+        val tar = makeTarGzWithSymlink("bin", "usr/bin")
+        install({ ByteArrayInputStream(tar) }, manifestOf(tar, "v-symlink"))
+        assertEquals("v-symlink", installer.installedVersion())
+        val link = File(installer.rootfsDir, "bin")
+        assertTrue(java.nio.file.Files.isSymbolicLink(link.toPath()),
+            "bin 必须是符号链接, 而不是被写成空文件")
+        assertEquals("usr/bin", java.nio.file.Files.readSymbolicLink(link.toPath()).toString())
     }
 }
