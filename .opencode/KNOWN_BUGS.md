@@ -153,17 +153,15 @@
 > 以下为 `/gate` 复验（专家团第二轮）确认的**可发布性缺口**——不影响当前 `main` 真绿，
 > 但在打正式 tag 发布前应逐项处理。
 
-| # | 位置 | 问题 | 级别 |
-|---|---|---|---|
-| G-1 | 发布路径 | **tag 路径零验证**：仓库无 tag，`job_release`/签名 Secrets 硬失败/ tag 口径 gate 从未运行，发布链路全是纸面。发布前需打一个 `v*` 预发 tag 跑通全链 | 高 |
+| G-1 | 发布路径 | **tag 路径零验证**（仍开）：仓库无 tag、**无任何签名 Secrets**。已加 "Release guard"（tag 缺 Secrets 时在 native 编译前 fail-fast），但发布链路（签名/`job_release` 发布/ tag 口径 gate）仍需先配置 `KEYSTORE_BASE64`/`KEYSTORE_PASSWORD`/`KEY_ALIAS`/`KEY_PASSWORD` 并打一个 `v*` 预发 tag 才能实跑验证 | 高 |
 | G-2 | `app/build.gradle.kts` | ~~lint 缺席~~ → ✅ 已修：`checkReleaseBuilds = true`，恢复 lintVitalRelease 出包门禁（只查 fatal） | 中 |
 | G-3 | `EngineClient.kt` / `EngineService.kt` | ~~测试护栏缺口~~ → ✅ 部分已修：新增 `EngineClientCoreTest`(13) + `EngineLogicTest`(8)——覆盖 parseEvent/DynamicBody/ApiDoc/Endpoints/SseQuota/SseSubscription 幂等 + compareSemver/SelfHeal。**仍缺**：`SseConnection` 重连全链路、`EngineService` 启动状态机（需 Robolectric/插桩） | 中 |
 | G-4 | 全仓库 | **UI 层零测试**（Compose，约 1800 行），需 Robolectric/Compose 测试基建 | 中 |
-| G-5 | `release.yml:237` / `app/build.gradle.kts` | 可复现性：**NDK 未锁版本**（`ls ndk/* \| sort -V \| tail -1` 取最新）；无 `ndkVersion`；无依赖校验和 / lockfile | 中 |
+| G-5 | `release.yml` / `app/build.gradle.kts` | ~~NDK 未锁版本~~ → ✅ 已修：`env.NDK_VERSION=30.0.16248370` + "Ensure pinned NDK"(sdkmanager 幂等安装) + "Locate NDK" 硬断言 ; gradle `ndkVersion` 同源。**仍缺**：Gradle 依赖校验和 / lockfile（`verification-metadata.xml`） | 中 |
 | G-6 | `release.yml` | ~~Release blocker grep 脆弱~~ → ✅ 已修：改为解析 `${VAR:-<default>}` 默认值（空/缺行均判缺失），并覆盖 proot 脚本 talloc/shmem | 中 |
-| G-7 | `snapshot/build-snapshot.sh:169,206-219` | Ubuntu base 与 opencode 包下载**无 sha256 校验**（opencode 仅比对版本字符串） | 低 |
+| G-7 | `snapshot/build-snapshot.sh` | ~~快照下载无 sha256~~ → ✅ 已修：ubuntu-base 对齐上游同目录 `SHA256SUMS` 动态校验；opencode 资产用 `OPENCODE_SHA256`（v1.18.34 实测）校验。**仍缺**：apt 安装的 payload 本身无法位复现（固有） | 低 |
 | — | `SettingsScreen.kt` | 未加 `snapshot_mirror` 的设置项 UI（引擎层已读该 prefs 键，用户暂需手动设置） | P3 |
-| — | 构建验证 | 本环境缺 `platform-35`，无法本地完整构建；以真实 CI（run #58/#59 全绿）为准 | — |
+| — | 构建验证 | 本环境缺 `platform-35`，无法本地完整构建；以真实 CI（run #58/#59/#60 全绿）为准 | — |
 
 ## `/gate` 复验结论（专家团 · qa + release-ops）
 
