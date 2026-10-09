@@ -176,6 +176,11 @@ dependencies {
     // P3 SnapshotInstaller 依赖声明（GZIP+TarArchiveInputStream 纯 Java 解包，零原生依赖）
     implementation("org.apache.commons:commons-compress:1.26.2")
 
+    // [PR7] JVM 单测: SnapshotInstaller 的校验/解压/幂等/路径穿越防护均为纯 JVM 逻辑,
+    // 无需真机即可回归。kotlin-test 提供断言, kotlinx-coroutines-test 提供 runTest。
+    testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+
     // ⚠ 依赖红线（P4 §6-2）: 不引 androidx.navigation:navigation-compose 与
     //   androidx.security:security-crypto —— UI 层已自实现等价能力，引入反而增依赖面。
 }
