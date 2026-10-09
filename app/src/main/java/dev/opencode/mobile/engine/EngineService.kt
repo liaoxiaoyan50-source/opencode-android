@@ -208,6 +208,12 @@ object Settings {
 
     fun wakeLockHours(context: Context): Int = prefs(context).getInt("wake_lock_hours", 6)
 
+    /**
+     * lite 变体快照下载的镜像前缀(P0-3)。留空则用 [SnapshotSource.DEFAULT_BASE]。
+     * 国内网络可设置为 ghproxy 类镜像以加速; 非机密, 明文存 prefs。
+     */
+    fun snapshotMirror(context: Context): String = prefs(context).getString("snapshot_mirror", "").orEmpty()
+
     private fun prefs(context: Context) =
         context.getSharedPreferences("engine_settings", Context.MODE_PRIVATE)
 }
@@ -283,23 +289,41 @@ class EngineService : Service() {
 
     /** 启动编排: 快照就绪 → oc-auth 注入 → PROOT_TMP_DIR 就绪 → L1 选模式 → 守护循环 */
     private suspend fun bootSequence() {
-        // 步骤1: 快照就绪(P1 §3.1: .snapshot-meta.json state!=ready 一律视为未安装 → 整目录重装;
-        //        M1-2 验收依赖此判定: 杀 App 重开 meta=ready 直接跳过安装)
-        if (installer.installedVersion() == null) {
-            val manifest = readBundledManifest()
+        // [P1-1 修复] 顶层异常收口。此前 allocatePort() 抛出的 IllegalStateException 会
+        // 逃逸出 bootSequence → scope.launch → 被 SupervisorJob 默认处理器吞掉 →
+        // state 永久停在 Starting, 不进 FAILED, 无诊断报告, 前台服务成为僵尸。
+        try {
+            bootSequenceInner()
+        } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t // 协作式取消不吞
+            appendEngineNote("[${now()}] [FATAL] bootSequence 未预期异常: ${t.javaClass.simpleName}: ${t.message}")
+            fail("引擎启动异常: ${t.javaClass.simpleName}", buildDiagnostics(currentMode))
+        }
+    }
+
+    private suspend fun bootSequenceInner() {
+        // 步骤1: 快照就绪。判定含「是否需要升级」(P0-4 修复): 此前只判 installedVersion()==null,
+        //        从不比对 bundled manifest 的 snapshotVersion, App 升级带来新快照时旧 rootfs 永不替换,
+        //        P6 M3-2 验收项不可能通过。
+        val bundled = readBundledManifest()
+        val installed = installer.installedVersion()
+        val needsInstall = installed == null ||
+            (bundled != null && bundled.snapshotVersion != installed)
+        if (needsInstall) {
+            if (installed != null && bundled != null) {
+                appendEngineNote(
+                    "[${now()}] 快照版本更新: 已装 $installed → 目标 ${bundled.snapshotVersion}, 执行升级(保留会话库)"
+                )
+            }
+            val manifest = bundled
                 ?: return fail("无可用快照",
                     "assets/snapshot/manifest.json 缺失或 schemaVersion!=1(P1 §3.1: 需升级 App)")
-            state.value = EngineState.Installing(InstallProgress.Finishing)
-            runCatching {
-                installer.install(
-                    openStream = SnapshotInstaller.fromAssets(this@EngineService, SNAPSHOT_ASSET),
-                    totalBytes = -1, manifest = manifest,
-                ) { state.value = EngineState.Installing(it) }
-            }.onFailure { return fail("快照安装失败", it.stackTraceToString()) }
+            runCatching { installSnapshot(manifest) }
+                .onFailure { return fail("快照安装失败", it.stackTraceToString()) }
         }
 
         // 步骤2: oc-auth 注入目录写入(P1 §3.5 配置唯一写入者原则: App 是 auth.json 与
-n        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /root/.config/opencode)
+        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /root/.config/opencode)
         runCatching { writeOcAuth() }
             .onFailure { return fail("oc-auth 注入失败", it.stackTraceToString()) }
 
@@ -316,6 +340,49 @@ n        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /r
         // 步骤6: 拉起守护循环(L2 自愈 + D8 崩溃退避)
         superviseEngine(currentMode)
     }
+
+    /**
+     * 安装快照(P0-3: 补全 lite 链路)。
+     *   - full 变体: tar 内嵌 assets → 直接读 assets 安装。
+     *   - lite 变体: 无 tar → 按 manifest 从 GitHub Release 下载 → SHA-256 校验 → 安装。
+     * 两路最终都汇聚到 SnapshotInstaller.install(SHA-256 → 解压 → 原子 rename)。
+     */
+    private suspend fun installSnapshot(manifest: SnapshotManifest) {
+        val hasBundledTar = runCatching { assets.open(SNAPSHOT_ASSET).close(); true }.getOrDefault(false)
+        if (hasBundledTar) {
+            state.value = EngineState.Installing(InstallProgress.Finishing)
+            installer.install(
+                openStream = SnapshotInstaller.fromAssets(this@EngineService, SNAPSHOT_ASSET),
+                totalBytes = -1, manifest = manifest,
+            ) { state.value = EngineState.Installing(it) }
+            return
+        }
+        // lite: 下载 → 校验 → 安装
+        state.value = EngineState.Installing(InstallProgress.Verifying(0, -1))
+        val base = Settings.snapshotMirror(this).ifBlank { SnapshotSource.DEFAULT_BASE }
+        val url = SnapshotSource.urlFor(base, appVersionName(), manifest.file)
+        appendEngineNote("[${now()}] [lite] 下载快照: $url (snapshot=${manifest.snapshotVersion})")
+        val dlClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS) // 大文件下载: 不设读超时
+            .build()
+        val file = LiteSnapshotDownloader(dlClient).download(
+            url = url,
+            manifest = manifest,
+            destDir = File(cacheDir, "snapshot-dl"),
+        ) { rb, tb -> state.value = EngineState.Installing(InstallProgress.Verifying(rb, tb)) }
+        installer.install(
+            openStream = SnapshotInstaller.fromDownload(file),
+            totalBytes = file.length(), manifest = manifest,
+        ) { state.value = EngineState.Installing(it) }
+        runCatching { file.delete() } // 解压完成后压缩包无保留价值
+    }
+
+    /** App versionName(拼 lite 下载 tag 用; 发布时 tag = v{versionName}) */
+    @Suppress("DEPRECATION")
+    private fun appVersionName(): String = runCatching {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
+    }.getOrDefault("0.0.0")
 
     /**
      * 引擎守护循环:
@@ -616,7 +683,7 @@ n        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /r
      */
     private fun buildDiagnostics(mode: ExecMode): String = buildString {
         appendLine("══ OpenCode 引擎诊断报告 ══")
-        appendLine("生成时间 : $now()")
+        appendLine("生成时间 : ${now()}")
         appendLine("最终模式 : $mode (全部尝试见 ExecMode 尝试历史)")
         appendLine("SELinux  : ${procText("/proc/self/attr/current")}")
         appendLine("内核     : ${System.getProperty("os.version") ?: "unknown"}")
@@ -686,7 +753,12 @@ n        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /r
         runCatching { File(filesDir, "engine-diagnostics.txt").writeText(detail) }
         state.value = EngineState.Failed(title, detail)
         notifyFailed(title)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        // [P1-4 修复] 原实现只 stopForeground 不 stopSelf, 服务降级为常驻 started service
+        // 不被回收(scope 与 OkHttpClient 一直存活)。对比 stopEngine() 是有 stopSelf 的。
+        runCatching {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     private fun startAsForeground() {
@@ -746,7 +818,7 @@ n        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /r
         if (wakeLock?.isHeld == true) return
         wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)
-            .also { it.acquire(TimeUnit.HOURS.toMillis(Settings.wakeLockHours(this).coerceIn(1, 24))) }
+            .also { it.acquire(TimeUnit.HOURS.toMillis(Settings.wakeLockHours(this).coerceIn(1, 24).toLong())) }
     }
 
     private fun releaseWakeLock() {
@@ -781,15 +853,18 @@ n        //        opencode.json 的唯一写入者; 该目录 bind 到 guest /r
 
     private fun now(): String = java.time.LocalDateTime.now().withNano(0).toString()
 
-    /** full 变体内置 manifest 读取; schemaVersion!=1 按 P1 §3.1 拒绝(提示升级 App) */
+    /** full/lite 内置 manifest 读取; schemaVersion!=1 按 P1 §3.1 拒绝(提示升级 App) */
     private fun readBundledManifest(): SnapshotManifest? = runCatching {
         val raw = assets.open("snapshot/manifest.json").bufferedReader().readText()
         fun s(k: String) = Regex("\"$k\"\\s*:\\s*\"([^\"]+)\"").find(raw)!!.groupValues[1]
         val schema = Regex("\"schemaVersion\"\\s*:\\s*(\\d+)").find(raw)
             ?.groupValues?.get(1)?.toIntOrNull()
         if (schema != 1) throw IllegalStateException("manifest schemaVersion=$schema, 需要升级 App")
+        // file 字段(C1 定稿)用于 lite 下载; 缺失时回落默认名(向后兼容旧 manifest)
+        val fileName = Regex("\"file\"\\s*:\\s*\"([^\"]+)\"").find(raw)?.groupValues?.get(1)
+            ?: "oc-ubuntu-arm64.tar.gz"
         SnapshotManifest(s("snapshotVersion"), s("ocVersion"), s("sha256"),
-            Regex("\"size\"\\s*:\\s*(\\d+)").find(raw)!!.groupValues[1].toLong())
+            Regex("\"size\"\\s*:\\s*(\\d+)").find(raw)!!.groupValues[1].toLong(), fileName)
     }.getOrNull()
 
     // ── 冻结参数与常量(出处见行内注释) ──────────────────────────
