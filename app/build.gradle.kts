@@ -152,6 +152,8 @@ android {
         // 单测里 android.jar 桩方法默认抛异常; 置 true 使其返回默认值, 避免偶发 Stub! 崩溃。
         // (org.json 另经 testImplementation 引入真实实现, 不依赖此开关。)
         unitTests.isReturnDefaultValues = true
+        // [G-3/G-4] Robolectric 需要访问 merged resources/assets 才能驱动 Android 组件与 Compose。
+        unitTests.isIncludeAndroidResources = true
     }
 }
 
@@ -196,6 +198,16 @@ dependencies {
     // [G-3] parseEvent/DynamicBody/ApiDoc 等依赖 org.json。Android 单测的 android.jar
     // 里 org.json 是 throw-Stub, 必须引入真实实现, 否则 JSONObject 一调用即抛。
     testImplementation("org.json:json:20231013")
+
+    // [G-3/G-4] Robolectric 测试基建: 在 JVM 上驱动 Android 组件(EngineService)与 Compose。
+    // sdk 固定 34(见各测试 @Config)——避开对 SDK 35 android-all 的版本依赖, 稳。
+    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("androidx.test.ext:junit:1.2.1")
+    testImplementation(platform("androidx.compose:compose-bom:2024.05.00"))
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    // Compose 测试需要一个可承载的 Activity, ui-test-manifest 在 debug 变体提供
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 
     // ⚠ 依赖红线（P4 §6-2）: 不引 androidx.navigation:navigation-compose 与
     //   androidx.security:security-crypto —— UI 层已自实现等价能力，引入反而增依赖面。
