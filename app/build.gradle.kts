@@ -212,3 +212,12 @@ dependencies {
     // ⚠ 依赖红线（P4 §6-2）: 不引 androidx.navigation:navigation-compose 与
     //   androidx.security:security-crypto —— UI 层已自实现等价能力，引入反而增依赖面。
 }
+
+// [诊断] 测试失败时打印完整异常栈(默认仅一行摘要)。CI 失败排查必需。
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showStackTraces = true
+    }
+}
