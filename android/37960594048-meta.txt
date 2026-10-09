@@ -1,0 +1,22 @@
+OpenCode Android CI 失败日志元信息 (ci-logs 分支, orphan 覆盖式推送)
+run_id      : 37960594048
+run_number  : 65
+run_attempt : 1
+job         : job_android (job_android, ubuntu-24.04 x86_64)
+commit_sha  : a04dc615ecc91ad4e31e0afc46a97c93d25bc22c
+event       : push
+ref         : refs/heads/main (type=branch, name=main)
+oc_version  : 1.18.34
+ndk_root    : /usr/local/lib/android/sdk/ndk/30.0.16248370
+app_version : 0.0.0-local
+pushed_at   : 2026-10-09T16:46:16Z
+
+路径映射 (runner 工作区 /home/runner/work/opencode-android/opencode-android → 本分支 android/):
+  proot-build.log   → android/37960594048-proot-build.log (存在时)
+  qemu-build.log    → android/37960594048-qemu-build.log (存在时)
+  compile-check.log → android/37960594048-compile-check.log (存在时, PR3 新增)
+  unit-test.log     → android/37960594048-unit-test.log (存在时, PR10 新增)
+  gradle-build.log  → android/37960594048-gradle-build.log (存在时)
+
+说明: 本分支永远只保留最近一次失败 job 的日志 (force 覆盖语义)。
+gate 类 step (无 tee) 的失败详情走 ::error annotation (check-runs 匿名可读)。
