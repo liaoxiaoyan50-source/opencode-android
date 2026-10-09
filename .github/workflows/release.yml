@@ -375,7 +375,10 @@ jobs:
           for apk in app/build/outputs/apk/full/release/*.apk app/build/outputs/apk/lite/release/*.apk; do
             LINE="$($"$AAPT2" dump xmltree --file AndroidManifest.xml "${apk}" | grep -m1 'extractNativeLibs' || true)"
             echo "${apk}: ${LINE:-<attribute absent>}"
-            echo "${LINE}" | grep -q '"true"' || {
+            # [Gate4 修复] aapt2 实际输出形如 `extractNativeLibs(0x010104ea)=true`
+            # (布尔值无引号, 部分版本为 0xffffffff)。原断言 grep '"true"'(带双引号)
+            # 与真实格式不符 → 恒误报 FAIL。改为匹配 =true 或 0xffffffff(不区分大小写)。
+            echo "${LINE}" | grep -qiE 'extractNativeLibs.*=(true|0xffffffff)' || {
               echo "::error::gate 4 FAIL: ${apk} manifest extractNativeLibs != true (D4: 库不解压 → nativeLibraryDir 无可执行文件 → 全链路不可用)"
               RC=1; }
           done
