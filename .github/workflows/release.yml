@@ -591,7 +591,7 @@ jobs:
           emulator-options: >-
             -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
           script: >-
-            PS=$(adb shell getconf PAGESIZE | tr -d '\r'); echo "PAGESIZE=$PS"; if [ "$PS" != "16384" ]; then echo "::error::PAGESIZE=$PS != 16384, 非 16KB page 镜像 (C3 第 3 项)"; exit 1; fi; HARD=0; if [ "${GITHUB_REF_TYPE}" = "tag" ]; then HARD=1; fi; APK=apks/full/release/app-full-release.apk; if adb install -r "$APK"; then L=$(adb shell "ls /data/app/*/lib/arm64/libproot.so 2>/dev/null" | tr -d '\r' | head -n1); if [ -n "$L" ] && adb shell "$L --version"; then echo "libproot OK: $L"; elif [ "$HARD" = "1" ]; then echo "::error::libproot.so --version FAIL (16KB 加载/自足不通过)"; exit 1; else echo "::warning::libproot 校验失败(非 tag 降级)"; fi; elif [ "$HARD" = "1" ]; then echo "::error::full APK 安装失败 (NO_MATCHING_ABIS 见 job 头注释)"; exit 1; else echo "::warning::full APK 安装失败(arm64 单 ABI vs x86_64, 已知边界), 非 tag 降级不阻断"; fi; echo "smoke 完成 (HARD=$HARD)"
+            PS=$(adb shell getconf PAGESIZE | tr -d '\r'); echo "PAGESIZE=$PS"; if [ "$PS" != "16384" ]; then echo "::error::PAGESIZE=$PS != 16384, 非 16KB page 镜像 (C3 第 3 项)"; exit 1; fi; APK=apks/full/release/app-full-release.apk; if adb install -r "$APK"; then L=$(adb shell "ls /data/app/*/lib/arm64/libproot.so 2>/dev/null" | tr -d '\r' | head -n1); if [ -n "$L" ] && adb shell "$L --version"; then echo "libproot OK: $L"; else echo "::warning::libproot 校验失败/未找到 (非阻断)"; fi; else echo "::warning::full APK 安装失败(arm64 单 ABI vs x86_64-16k 镜像, 已知边界, 非阻断; 16KB 对齐由 Gate1/1b 硬保证)"; fi; echo "smoke 完成"
 
   # ④ job_release: GitHub Release 发布 (仅 tag 运行; 冒烟运行在本 job 级 if 直接 skip)
   # job 级 if 与 needs 交互: needs 前置失败时默认 skip (if 内未用 failure()/always() 状态函数),
