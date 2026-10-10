@@ -847,7 +847,10 @@ class EngineService : Service() {
         const val ACTION_STOP = "dev.opencode.mobile.engine.STOP"
 
         private const val MAIN_ACTIVITY = "dev.opencode.mobile.ui.MainActivity"   // ui-layer 落点
-        private const val SNAPSHOT_ASSET = "snapshot/oc-ubuntu-arm64.tar.gz"      // full 变体资产路径
+        // full 变体资产路径。⚠ 不能以 .gz 结尾: AAPT2 会把 .gz 资产自动解压并去掉后缀
+        // (打包成 oc-ubuntu-arm64.tar, 402MB 未压缩) → assets.open 找不到原名 → 误回退
+        // 到 lite 网络下载而失败。故内嵌资产用 .tgz 命名(AAPT 不改动)。见 KNOWN_BUGS G-8。
+        private const val SNAPSHOT_ASSET = "snapshot/oc-ubuntu-arm64.tgz"
         private const val WAKELOCK_TAG = "opencode:engine"
         private const val HEX = "0123456789abcdef"                                // 小写 hex 字符池
 

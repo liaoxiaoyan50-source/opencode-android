@@ -160,6 +160,8 @@
 | G-5 | `release.yml` / `app/build.gradle.kts` / wrapper | ~~NDK 未锁~~ → ✅ NDK 锁定(env.NDK_VERSION + Ensure pinned NDK + gradle ndkVersion)；✅ wrapper `distributionSha256Sum`(Gradle 分发包完整性)。**仍缺**：Gradle 依赖校验和(`verification-metadata.xml`, 需在 CI 生成) | 中 |
 | G-6 | `release.yml` | ~~Release blocker grep 脆弱~~ → ✅ 已修：改为解析 `${VAR:-<default>}` 默认值（空/缺行均判缺失），并覆盖 proot 脚本 talloc/shmem | 中 |
 | G-7 | `snapshot/build-snapshot.sh` | ~~快照下载无 sha256~~ → ✅ 已修：ubuntu-base 对齐上游同目录 `SHA256SUMS` 动态校验；opencode 资产用 `OPENCODE_SHA256`（v1.18.34 实测）校验。**仍缺**：apt 安装的 payload 本身无法位复现（固有） | 低 |
+| G-8 | `EngineService.kt` / `app/build.gradle.kts` / `release.yml` | **AAPT2 改写 `.gz` 资产名**（真机运行才暴露）：CI 注入 `oc-ubuntu-arm64.tar.gz` 被 AAPT2 自动解压去后缀成 `assets/snapshot/oc-ubuntu-arm64.tar`（402MB 未压缩）→ app 按原名 `assets.open` 找不到 → 误回退 lite 网络下载 → 「快照安装失败」。修：内嵌资产改用 `.tgz`（AAPT 不改动）+ 新增 `Gate 5` 断言 APK 内资产名完好 | 高 |
+| — | 运行时 | 真机首启仍待验证（G-8 修复后重发 v1.0.1 再测）；proot 实际执行 `opencode serve` 尚未在真机跑通 | 高 |
 | — | `SettingsScreen.kt` | 未加 `snapshot_mirror` 的设置项 UI（引擎层已读该 prefs 键，用户暂需手动设置） | P3 |
 | — | 构建验证 | 本环境缺 `platform-35`，无法本地完整构建；以真实 CI（run #58/#59/#60 全绿）为准 | — |
 

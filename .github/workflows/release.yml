@@ -360,8 +360,12 @@ jobs:
         run: |
           # full: tar.gz + manifest 内嵌(full 变体直接读 assets 安装)
           mkdir -p app/src/full/assets/snapshot
-          cp dist/oc-ubuntu-arm64.tar.gz dist/manifest.json app/src/full/assets/snapshot/
-          # lite: 仅 manifest(小文件, 供首启下载时读取 file/sha256/size) —— 不含 tar.gz
+          # [G-8] 落成 .tgz 而非 .tar.gz: AAPT2 会自动解压 .gz 资产并去掉后缀
+          # (打包成 oc-ubuntu-arm64.tar 未压缩) → app 按原名 assets.open 找不到 →
+          # 误回退 lite 网络下载而失败。.tgz 不被 AAPT 特殊处理。
+          cp dist/oc-ubuntu-arm64.tar.gz app/src/full/assets/snapshot/oc-ubuntu-arm64.tgz
+          cp dist/manifest.json app/src/full/assets/snapshot/
+          # lite: 仅 manifest(小文件, 供首启下载时读取 file/sha256/size) —— 不含 tar
           # [PR8] lite 的下载链路依赖此 manifest; 缺它则 readBundledManifest() 返回 null → fail
           mkdir -p app/src/lite/assets/snapshot
           cp dist/manifest.json app/src/lite/assets/snapshot/
@@ -420,6 +424,18 @@ jobs:
               RC=1; }
           done
           exit ${RC}
+
+      # [G-8] 断言 full APK 内嵌快照资产名未被 AAPT2 改写(.gz 会被自动解压去后缀)。
+      # 历史 bug: 注入的 oc-ubuntu-arm64.tar.gz 被打成 assets/snapshot/oc-ubuntu-arm64.tar
+      # (402MB 未压缩) → app 按原名 assets.open 失败 → 误回退 lite 网络下载 → 快照安装失败。
+      - name: "Gate 5: bundled snapshot asset name intact"
+        run: |
+          APK=app/build/outputs/apk/full/release/app-full-release.apk
+          ENTRIES="$(unzip -Z1 "${APK}" | grep '^assets/snapshot/' || true)"
+          echo "full APK snapshot assets:"; echo "${ENTRIES}"
+          echo "${ENTRIES}" | grep -q 'assets/snapshot/oc-ubuntu-arm64.tgz' \
+            || { echo "::error::Gate5 FAIL: full APK 缺 assets/snapshot/oc-ubuntu-arm64.tgz（被 AAPT 改名/丢失？）"; exit 1; }
+          echo "Gate5 PASS: 内嵌快照资产名完好"
 
       - name: "Gate 1b: packaged .so alignment recheck (from APK)"
         run: |

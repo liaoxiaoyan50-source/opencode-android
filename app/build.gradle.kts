@@ -161,7 +161,9 @@ android {
 val validateFullSnapshotAssets = tasks.register("validateFullSnapshotAssets") {
     doLast {
         val dir = file("src/full/assets/snapshot")
-        val tar = file("src/full/assets/snapshot/oc-ubuntu-arm64.tar.gz")
+        // [G-8] 内嵌资产用 .tgz(不能用 .gz): AAPT2 会自动解压 .gz 并去后缀, 导致 app 按
+        // 原名 assets.open 失败。CI 注入时同样落到 .tgz。
+        val tar = file("src/full/assets/snapshot/oc-ubuntu-arm64.tgz")
         val manifest = file("src/full/assets/snapshot/manifest.json")
         if (!tar.isFile || !manifest.isFile) {
             throw GradleException(
