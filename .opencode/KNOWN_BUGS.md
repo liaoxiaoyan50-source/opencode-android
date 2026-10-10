@@ -153,11 +153,11 @@
 > 以下为 `/gate` 复验（专家团第二轮）确认的**可发布性缺口**——不影响当前 `main` 真绿，
 > 但在打正式 tag 发布前应逐项处理。
 
-| G-1 | 发布路径 | **tag 路径零验证**（仍开）：仓库无 tag、**无任何签名 Secrets**。已加 "Release guard"（tag 缺 Secrets 时在 native 编译前 fail-fast），但发布链路（签名/`job_release` 发布/ tag 口径 gate）仍需先配置 `KEYSTORE_BASE64`/`KEYSTORE_PASSWORD`/`KEY_ALIAS`/`KEY_PASSWORD` 并打一个 `v*` 预发 tag 才能实跑验证 | 高 |
+| G-1 | 发布路径 | ~~tag 路径零验证~~ → ✅ **已验证**：4 个签名 Secrets 经 GitHub API 写入；修掉「tag 冒烟对 ABI 不可能断言硬失败卡死发布」的设计缺陷（安装/库校验恒降级 warning，PAGESIZE 仍硬）；打 `v0.0.1` 预发 tag → 全绿并**成功发布 Release**（四件套：full APK 135MB / lite APK 10MB / manifest.json / tar 125MB）。**注意**：签名密钥在服务器 `/root/keystore/`（upload.jks + store_pw.txt），请下载备份 | 高 |
 | G-2 | `app/build.gradle.kts` | ~~lint 缺席~~ → ✅ 已修：`checkReleaseBuilds = true`，恢复 lintVitalRelease 出包门禁（只查 fatal） | 中 |
-| G-3 | `EngineClient.kt` / `EngineService.kt` | ~~测试护栏缺口~~ → ✅ 大部分已修（累计 47 单测全绿）：纯 JVM `EngineClientCoreTest`(13)+`EngineLogicTest`(10, 含 bootSequence 决策 `needsSnapshotInstall`/`isBlockedByMinAppVersion`)；Robolectric `EngineServiceTest`(2, proot 命令契约 C6)+`ExecCompatTest`(3)+`EngineBusTest`(1)；**`SseConnectionTest`(2, MockWebServer 断流重连全链路)**。**仍缺**：`bootSequence` 完整状态机端到端（CI 单测阶段快照已注入会真解压 120MB, 不宜做, 已用决策函数覆盖核心判断） | 中 |
-| G-4 | 全仓库 | ~~UI 零测试~~ → ✅ 基建+业务屏已建：Robolectric + Compose；`ComposeUiSmokeTest`(1) + `ChatPaneRenderTest`(1, 真实 ChatController 渲染) + `PermissionDialogTest`(1, 点击回执)。**仍缺**：SessionsPane 会话列表等更多交互 | 中 |
-| G-5 | `release.yml` / `app/build.gradle.kts` | ~~NDK 未锁版本~~ → ✅ 已修：`env.NDK_VERSION=30.0.16248370` + "Ensure pinned NDK"(sdkmanager 幂等安装) + "Locate NDK" 硬断言 ; gradle `ndkVersion` 同源。**仍缺**：Gradle 依赖校验和 / lockfile（`verification-metadata.xml`） | 中 |
+| G-3 | `EngineClient.kt` / `EngineService.kt` | ~~测试护栏缺口~~ → ✅ 大部分已修（累计 47 单测全绿）：纯 JVM `EngineClientCoreTest`(13)+`EngineLogicTest`(10, 含 bootSequence 决策)；Robolectric `EngineServiceTest`(2, proot 命令契约 C6)+`ExecCompatTest`(3)+`EngineBusTest`(1)；`SseConnectionTest`(2, MockWebServer 断流重连全链路)。**仍缺**：`bootSequence` 完整状态机端到端（CI 单测阶段快照已注入会真解压 120MB, 不宜做, 已用决策函数覆盖核心判断） | 中 |
+| G-4 | 全仓库 | ~~UI 零测试~~ → ✅ 基建+多业务屏已建：Robolectric + Compose；`ComposeUiSmokeTest`(1) + `ChatPaneRenderTest`(1) + `PermissionDialogTest`(1) + `SessionsPaneTest`(1, 点击会话回调)。**仍缺**：SettingsScreen/TerminalScreen 等 | 中 |
+| G-5 | `release.yml` / `app/build.gradle.kts` / wrapper | ~~NDK 未锁~~ → ✅ NDK 锁定(env.NDK_VERSION + Ensure pinned NDK + gradle ndkVersion)；✅ wrapper `distributionSha256Sum`(Gradle 分发包完整性)。**仍缺**：Gradle 依赖校验和(`verification-metadata.xml`, 需在 CI 生成) | 中 |
 | G-6 | `release.yml` | ~~Release blocker grep 脆弱~~ → ✅ 已修：改为解析 `${VAR:-<default>}` 默认值（空/缺行均判缺失），并覆盖 proot 脚本 talloc/shmem | 中 |
 | G-7 | `snapshot/build-snapshot.sh` | ~~快照下载无 sha256~~ → ✅ 已修：ubuntu-base 对齐上游同目录 `SHA256SUMS` 动态校验；opencode 资产用 `OPENCODE_SHA256`（v1.18.34 实测）校验。**仍缺**：apt 安装的 payload 本身无法位复现（固有） | 低 |
 | — | `SettingsScreen.kt` | 未加 `snapshot_mirror` 的设置项 UI（引擎层已读该 prefs 键，用户暂需手动设置） | P3 |
